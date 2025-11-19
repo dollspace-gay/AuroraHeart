@@ -23,6 +23,10 @@ serde_json.workspace = true
 
 # Async runtime
 tokio.workspace = true
+futures = "0.3"
+
+# Byte manipulation
+bytes = "1.9"
 
 # Logging
 tracing.workspace = true

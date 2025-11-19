@@ -3,12 +3,15 @@
 //! This is the main executable for the AuroraHeart IDE, a Windows-native IDE
 //! with first-class AI agent integration built in Rust with Slint.
 
+use aurora_agent::{AnthropicClient, Conversation, StreamEvent};
 use aurora_core::{
     detect_language, find_project_root, get_project_name, read_file, write_file, Config,
-    ConfigError,
+    ConfigError, CredentialStore,
 };
+use futures::StreamExt;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 slint::include_modules!();
 
@@ -123,7 +126,34 @@ fn save_current_file(main_window: &MainWindow) {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Save API key to encrypted credential store
+fn save_api_key(project_root: &Path, api_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = CredentialStore::for_project(project_root);
+    store.store("anthropic_api_key", api_key, "auroraheart")?;
+    tracing::info!("API key saved successfully");
+    Ok(())
+}
+
+/// Load API key from encrypted credential store
+fn load_api_key(project_root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let store = CredentialStore::for_project(project_root);
+    let api_key = store.retrieve("anthropic_api_key", "auroraheart")?;
+    Ok(api_key)
+}
+
+/// Mask API key for display (show first 7 chars and last 4 chars)
+fn mask_api_key(api_key: &str) -> String {
+    if api_key.len() <= 11 {
+        return "****".to_string();
+    }
+
+    let prefix = &api_key[..7];  // "sk-ant-"
+    let suffix = &api_key[api_key.len()-4..];
+    format!("{}...{}", prefix, suffix)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     init_tracing();
     tracing::info!("Starting AuroraHeart IDE");
@@ -196,6 +226,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_tree_model = Rc::new(slint::VecModel::from(file_tree));
     main_window.set_file_tree_items(file_tree_model.into());
 
+    // Load and set masked API key if it exists
+    if let Ok(api_key) = load_api_key(&project_root) {
+        let masked = mask_api_key(&api_key);
+        main_window.set_api_key_masked(masked.into());
+        tracing::info!("Loaded existing API key");
+    }
+
     // Set welcome message in chat
     let welcome_message = format!(
         "Hello! I'm Claude, your AI coding assistant.\n\nProject: {}\n{}Ready to help you code!",
@@ -234,19 +271,154 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Create persistent conversation with system prompt
+    let conversation = Arc::new(Mutex::new(
+        Conversation::with_system_prompt(
+            "You are Claude, a helpful AI assistant integrated into AuroraHeart IDE. \
+             You help developers with coding tasks, explaining code, debugging, and general programming questions."
+        )
+    ));
+
     // Set up chat message callback
     let window_weak_chat = main_window.as_weak();
+    let project_root_chat = project_root.clone();
+    let conversation_clone = conversation.clone();
     main_window.on_send_message(move |message| {
         if let Some(window) = window_weak_chat.upgrade() {
             tracing::info!("Chat message: {}", message);
 
+            // Update UI to show user message
             let current_output = window.get_chat_output();
             let new_output = format!(
-                "{}\n\n> {}\n\n[AI integration coming in Phase 2]\n",
+                "{}\n\n> You: {}\n\nClaude: ",
                 current_output, message
             );
-            window.set_chat_output(new_output.into());
-            window.set_status_message("Message sent (AI integration pending)".into());
+            window.set_chat_output(new_output.clone().into());
+            window.set_status_message("Sending message to Claude...".into());
+
+            // Load API key
+            let api_key = match load_api_key(&project_root_chat) {
+                Ok(key) => key,
+                Err(e) => {
+                    let error_msg = format!("{}⚠ No API key configured. Please set your API key in Settings.", new_output);
+                    window.set_chat_output(error_msg.into());
+                    window.set_status_message("API key not found".into());
+                    tracing::error!("Failed to load API key: {}", e);
+                    return;
+                }
+            };
+
+            // Add user message to conversation and truncate if needed
+            {
+                let mut conv = conversation_clone.lock().unwrap();
+                conv.add_user_message(message.as_str());
+                // Keep conversation within reasonable limits (50k tokens = ~200k chars)
+                let removed = conv.truncate_to_tokens(50_000);
+                if removed > 0 {
+                    tracing::info!("Truncated {} old messages from conversation", removed);
+                }
+            }
+
+            // Create client and clone conversation for API call
+            let client = AnthropicClient::new(api_key);
+            let conversation_for_api = conversation_clone.lock().unwrap().clone();
+
+            // Clone window weak and conversation for async task
+            let window_weak_async = window_weak_chat.clone();
+            let conversation_async = conversation_clone.clone();
+
+            // Spawn async task to send message and stream response
+            tokio::spawn(async move {
+                match client.send_conversation_stream(&conversation_for_api).await {
+                    Ok(mut stream) => {
+                        let mut accumulated_text = String::new();
+
+                        while let Some(event_result) = stream.next().await {
+                            match event_result {
+                                Ok(StreamEvent::ContentBlockDelta { delta, .. }) => {
+                                    let aurora_agent::Delta::TextDelta { text } = delta;
+                                    accumulated_text.push_str(&text);
+
+                                    // Update UI with accumulated text
+                                    let text_clone = accumulated_text.clone();
+                                    let output_base = new_output.clone();
+                                    let window_weak_clone = window_weak_async.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(w) = window_weak_clone.upgrade() {
+                                            let display_text = format!("{}{}", output_base, text_clone);
+                                            w.set_chat_output(display_text.into());
+                                        }
+                                    });
+                                }
+                                Ok(StreamEvent::MessageStop) => {
+                                    tracing::info!("Stream completed");
+
+                                    // Save assistant's response to conversation
+                                    if !accumulated_text.is_empty() {
+                                        if let Ok(mut conv) = conversation_async.lock() {
+                                            conv.add_assistant_message(&accumulated_text);
+                                            tracing::debug!("Added assistant message to conversation");
+                                        }
+                                    }
+
+                                    let window_weak_clone = window_weak_async.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(w) = window_weak_clone.upgrade() {
+                                            w.set_status_message("Message complete".into());
+                                        }
+                                    });
+                                    break;
+                                }
+                                Ok(StreamEvent::Error { error }) => {
+                                    tracing::error!("Stream error: {:?}", error);
+                                    let error_msg = format!("\n\n⚠ Error: {}", error.message);
+                                    let output_base = new_output.clone();
+                                    let accumulated = accumulated_text.clone();
+                                    let window_weak_clone = window_weak_async.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(w) = window_weak_clone.upgrade() {
+                                            let display = format!("{}{}{}", output_base, accumulated, error_msg);
+                                            w.set_chat_output(display.into());
+                                            w.set_status_message("Error occurred".into());
+                                        }
+                                    });
+                                    break;
+                                }
+                                Ok(_) => {
+                                    // Other events like Ping, MessageStart, etc.
+                                }
+                                Err(e) => {
+                                    tracing::error!("Stream error: {:?}", e);
+                                    let error_msg = format!("\n\n⚠ Error: {}", e);
+                                    let output_base = new_output.clone();
+                                    let accumulated = accumulated_text.clone();
+                                    let window_weak_clone = window_weak_async.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(w) = window_weak_clone.upgrade() {
+                                            let display = format!("{}{}{}", output_base, accumulated, error_msg);
+                                            w.set_chat_output(display.into());
+                                            w.set_status_message("Connection error".into());
+                                        }
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to send message: {:?}", e);
+                        let error_msg = format!("\n\n⚠ Failed to send message: {}", e);
+                        let output_base = new_output.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = window_weak_async.upgrade() {
+                                let display = format!("{}{}", output_base, error_msg);
+                                w.set_chat_output(display.into());
+                                w.set_status_message("Failed to connect".into());
+                            }
+                        });
+                    }
+                }
+            });
         }
     });
 
@@ -258,6 +430,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let original_text = window.get_original_content();
             let is_modified = current_text != original_text;
             window.set_is_modified(is_modified);
+        }
+    });
+
+    // Set up save API key callback
+    let project_root_save = project_root.clone();
+    let window_weak_save_key = main_window.as_weak();
+    main_window.on_save_api_key(move |api_key| {
+        if let Some(window) = window_weak_save_key.upgrade() {
+            match save_api_key(&project_root_save, api_key.as_str()) {
+                Ok(()) => {
+                    let masked = mask_api_key(api_key.as_str());
+                    window.set_api_key_masked(masked.into());
+                    window.set_status_message("API key saved successfully".into());
+                    tracing::info!("API key saved via UI");
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to save API key: {}", e);
+                    window.set_status_message(error_msg.clone().into());
+                    tracing::error!("{}", error_msg);
+                }
+            }
+        }
+    });
+
+    // Set up load API key callback
+    let project_root_load = project_root.clone();
+    main_window.on_load_api_key(move || {
+        match load_api_key(&project_root_load) {
+            Ok(api_key) => {
+                tracing::info!("API key loaded via UI");
+                api_key.into()
+            }
+            Err(_) => {
+                tracing::debug!("No API key found");
+                "".into()
+            }
+        }
+    });
+
+    // Set up clear chat callback
+    let window_weak_clear = main_window.as_weak();
+    let conversation_clear = conversation.clone();
+    main_window.on_clear_chat(move || {
+        if let Some(window) = window_weak_clear.upgrade() {
+            // Clear the conversation state
+            if let Ok(mut conv) = conversation_clear.lock() {
+                conv.clear();
+                tracing::info!("Conversation cleared");
+            }
+
+            // Reset the chat UI with welcome message
+            let welcome_message = format!(
+                "Hello! I'm Claude, your AI coding assistant.\n\nConversation cleared. Ready to help you code!"
+            );
+            window.set_chat_output(welcome_message.into());
+            window.set_status_message("Chat cleared".into());
         }
     });
 

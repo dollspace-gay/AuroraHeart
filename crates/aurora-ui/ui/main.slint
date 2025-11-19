@@ -21,6 +21,10 @@ export component MainWindow inherits Window {
     callback send-message(string);
     callback file-selected(string);
     callback text-edited();
+    callback open-settings();
+    callback save-api-key(string);
+    callback load-api-key() -> string;
+    callback clear-chat();
 
     // Properties
     in-out property <string> editor-text: "";
@@ -32,6 +36,9 @@ export component MainWindow inherits Window {
     in-out property <[FileTreeItem]> file-tree-items: [];
     in-out property <bool> is-modified: false;
     in-out property <string> original-content: "";
+    in-out property <bool> show-settings-dialog: false;
+    in-out property <string> api-key-input: "";
+    in-out property <string> api-key-masked: "";
 
     VerticalBox {
         padding: 0px;
@@ -68,6 +75,27 @@ export component MainWindow inherits Window {
                     text: "Save";
                     enabled: root.current-file != "" && root.is-modified;
                     clicked => { root.save-file(); }
+                }
+
+                Rectangle {
+                    width: 20px;
+                }
+
+                Button {
+                    text: "Settings";
+                    clicked => {
+                        root.api-key-input = root.load-api-key();
+                        root.show-settings-dialog = true;
+                    }
+                }
+
+                Rectangle {
+                    width: 20px;
+                }
+
+                Button {
+                    text: "Clear Chat";
+                    clicked => { root.clear-chat(); }
                 }
             }
         }
@@ -359,6 +387,120 @@ export component MainWindow inherits Window {
                     color: Theme.text-secondary;
                     font-size: Theme.font-size-small;
                     vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // Settings Dialog
+    if root.show-settings-dialog: Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #00000088;
+
+        Rectangle {
+            width: 500px;
+            height: 300px;
+            background: Theme.background-medium;
+            border-width: Theme.border-width;
+            border-color: Theme.border-color;
+
+            VerticalBox {
+                padding: Theme.padding-medium;
+                spacing: Theme.spacing-medium;
+
+                // Dialog header
+                HorizontalBox {
+                    Text {
+                        text: "Settings";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-size-large;
+                        font-weight: 700;
+                        horizontal-alignment: left;
+                    }
+
+                    Rectangle {
+                        // Spacer
+                    }
+
+                    Button {
+                        text: "✕";
+                        width: 30px;
+                        clicked => {
+                            root.show-settings-dialog = false;
+                            root.api-key-input = "";
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border-color;
+                }
+
+                // API Key section
+                VerticalBox {
+                    spacing: Theme.spacing-small;
+                    alignment: start;
+
+                    Text {
+                        text: "Anthropic API Key";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-size-normal;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "Your API key is stored securely and encrypted locally.";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-size-small;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle {
+                        height: 10px;
+                    }
+
+                    TextEdit {
+                        text <=> root.api-key-input;
+                        placeholder-text: "Enter your Anthropic API key (sk-ant-...)";
+                        font-size: Theme.font-size-normal;
+                        height: 40px;
+                    }
+
+                    if root.api-key-masked != "": Text {
+                        text: "Current key: " + root.api-key-masked;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-size-small;
+                    }
+                }
+
+                Rectangle {
+                    // Spacer to push buttons to bottom
+                }
+
+                // Dialog buttons
+                HorizontalBox {
+                    alignment: end;
+                    spacing: Theme.spacing-small;
+
+                    Button {
+                        text: "Cancel";
+                        clicked => {
+                            root.show-settings-dialog = false;
+                            root.api-key-input = "";
+                        }
+                    }
+
+                    Button {
+                        text: "Save";
+                        enabled: root.api-key-input != "";
+                        clicked => {
+                            root.save-api-key(root.api-key-input);
+                            root.show-settings-dialog = false;
+                            root.api-key-input = "";
+                        }
+                    }
                 }
             }
         }

@@ -11,7 +11,7 @@ pub mod tools;
 pub mod conversation;
 pub mod directives;
 
-pub use client::{AnthropicClient, ClientError};
+pub use client::{AnthropicClient, ClientError, StreamEvent, Delta, ApiError};
 pub use conversation::{Conversation, Message, Role};
 pub use directives::DirectiveManager;
 

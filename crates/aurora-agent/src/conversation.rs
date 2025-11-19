@@ -92,6 +92,56 @@ impl Conversation {
         self.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0)
             + self.messages.iter().map(|m| m.content.len()).sum::<usize>()
     }
+
+    /// Get the number of messages in the conversation
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Truncate conversation to stay within a character limit
+    /// Removes oldest messages while preserving recent context
+    ///
+    /// # Arguments
+    /// * `max_chars` - Maximum number of characters to keep (excluding system prompt)
+    ///
+    /// # Returns
+    /// Number of messages removed
+    pub fn truncate_to_limit(&mut self, max_chars: usize) -> usize {
+        let system_chars = self.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
+        let mut current_chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+
+        if current_chars + system_chars <= max_chars {
+            return 0; // No truncation needed
+        }
+
+        let mut removed_count = 0;
+        let target_chars = max_chars.saturating_sub(system_chars);
+
+        // Remove messages from the beginning until we're under the limit
+        while current_chars > target_chars && !self.messages.is_empty() {
+            if let Some(msg) = self.messages.first() {
+                current_chars = current_chars.saturating_sub(msg.content.len());
+            }
+            self.messages.remove(0);
+            removed_count += 1;
+        }
+
+        removed_count
+    }
+
+    /// Ensure conversation stays within token budget by truncating if needed
+    /// Uses a rough approximation of 4 characters per token
+    ///
+    /// # Arguments
+    /// * `max_tokens` - Maximum number of tokens to keep
+    ///
+    /// # Returns
+    /// Number of messages removed
+    pub fn truncate_to_tokens(&mut self, max_tokens: usize) -> usize {
+        // Rough approximation: 4 chars per token
+        let max_chars = max_tokens * 4;
+        self.truncate_to_limit(max_chars)
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +200,72 @@ mod tests {
 
         // "12345" + "Hello" + "Hi" = 5 + 5 + 2 = 12
         assert_eq!(conv.total_chars(), 12);
+    }
+
+    #[test]
+    fn test_message_count() {
+        let mut conv = Conversation::new();
+        assert_eq!(conv.message_count(), 0);
+
+        conv.add_user_message("Hello");
+        assert_eq!(conv.message_count(), 1);
+
+        conv.add_assistant_message("Hi");
+        assert_eq!(conv.message_count(), 2);
+    }
+
+    #[test]
+    fn test_truncate_to_limit_no_truncation_needed() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("Hello");
+        conv.add_assistant_message("Hi");
+
+        let removed = conv.truncate_to_limit(100);
+        assert_eq!(removed, 0);
+        assert_eq!(conv.message_count(), 2);
+    }
+
+    #[test]
+    fn test_truncate_to_limit_removes_oldest() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("First message");  // 13 chars
+        conv.add_assistant_message("Second");    // 6 chars
+        conv.add_user_message("Third");          // 5 chars
+
+        // Total: 24 chars, limit to 15 chars
+        let removed = conv.truncate_to_limit(15);
+        assert_eq!(removed, 1); // Should remove first message
+        assert_eq!(conv.message_count(), 2);
+        assert_eq!(conv.messages()[0].content, "Second");
+        assert_eq!(conv.messages()[1].content, "Third");
+    }
+
+    #[test]
+    fn test_truncate_to_limit_with_system_prompt() {
+        let mut conv = Conversation::with_system_prompt("System prompt"); // 13 chars
+        conv.add_user_message("Hello");  // 5 chars
+        conv.add_assistant_message("Hi"); // 2 chars
+
+        // Total: 13 + 5 + 2 = 20 chars, limit to 15 chars
+        // Should remove "Hello" to get under limit
+        let removed = conv.truncate_to_limit(15);
+        assert_eq!(removed, 1);
+        assert_eq!(conv.message_count(), 1);
+        assert_eq!(conv.messages()[0].content, "Hi");
+    }
+
+    #[test]
+    fn test_truncate_to_tokens() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("a".repeat(20)); // 20 chars = ~5 tokens
+        conv.add_assistant_message("b".repeat(20)); // 20 chars = ~5 tokens
+        conv.add_user_message("c".repeat(20)); // 20 chars = ~5 tokens
+
+        // Total: 60 chars = ~15 tokens
+        // Limit to 6 tokens = ~24 chars, should remove first 2 messages (40 chars) to get to 20 chars
+        let removed = conv.truncate_to_tokens(6);
+        assert_eq!(removed, 2);
+        assert_eq!(conv.message_count(), 1);
+        assert_eq!(conv.messages()[0].content, "c".repeat(20));
     }
 }

@@ -496,6 +496,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aurora-core",
+ "bytes",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
@@ -529,7 +531,9 @@ name = "aurora-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aurora-agent",
  "aurora-core",
+ "futures",
  "slint",
  "slint-build",
  "thiserror 2.0.17",
