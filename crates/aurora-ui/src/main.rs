@@ -70,8 +70,10 @@ fn load_file_tree<P: AsRef<Path>>(dir: P) -> Vec<FileTreeItem> {
 fn open_file_in_editor(main_window: &MainWindow, file_path: &str) {
     match read_file(file_path) {
         Ok(content) => {
-            main_window.set_editor_text(content.into());
+            main_window.set_editor_text(content.clone().into());
+            main_window.set_original_content(content.into());
             main_window.set_current_file(file_path.into());
+            main_window.set_is_modified(false);
 
             let file_name = Path::new(file_path)
                 .file_name()
@@ -101,6 +103,10 @@ fn save_current_file(main_window: &MainWindow) {
 
     match write_file(current_file.as_str(), content.as_str()) {
         Ok(()) => {
+            // Update original content and clear modified state
+            main_window.set_original_content(content.clone());
+            main_window.set_is_modified(false);
+
             let file_name = Path::new(current_file.as_str())
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -241,6 +247,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             window.set_chat_output(new_output.into());
             window.set_status_message("Message sent (AI integration pending)".into());
+        }
+    });
+
+    // Set up text editing callback to detect changes
+    let window_weak_edit = main_window.as_weak();
+    main_window.on_text_edited(move || {
+        if let Some(window) = window_weak_edit.upgrade() {
+            let current_text = window.get_editor_text();
+            let original_text = window.get_original_content();
+            let is_modified = current_text != original_text;
+            window.set_is_modified(is_modified);
         }
     });
 
