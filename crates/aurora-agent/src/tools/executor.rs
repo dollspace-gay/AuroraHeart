@@ -66,6 +66,9 @@ impl ToolExecutor {
             "syntax_check" => self.execute_syntax_check(&tool_use.input).await,
             "code_format" => self.execute_code_format(&tool_use.input).await,
             "code_analysis" => self.execute_code_analysis(&tool_use.input).await,
+            "copy" => self.execute_copy(&tool_use.input).await,
+            "delete" => self.execute_delete(&tool_use.input).await,
+            "move" => self.execute_move(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -1500,6 +1503,281 @@ impl ToolExecutor {
             }
         }
     }
+
+    /// Execute the Copy tool
+    async fn execute_copy(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let source_str = input["source"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing source".to_string()))?;
+
+        let destination_str = input["destination"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing destination".to_string()))?;
+
+        let overwrite = input["overwrite"].as_bool().unwrap_or(false);
+        let recursive = input["recursive"].as_bool().unwrap_or(true);
+
+        // Resolve paths
+        let source = Path::new(source_str);
+        let source_path = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            self.working_directory.join(source)
+        };
+
+        let destination = Path::new(destination_str);
+        let dest_path = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            self.working_directory.join(destination)
+        };
+
+        // Check if source exists
+        if !source_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "Source does not exist: {}",
+                source_path.display()
+            )));
+        }
+
+        // Check if destination already exists and overwrite is false
+        if dest_path.exists() && !overwrite {
+            return Err(ToolError::InvalidInput(format!(
+                "Destination already exists: {}. Set overwrite=true to replace it.",
+                dest_path.display()
+            )));
+        }
+
+        // Perform the copy
+        if source_path.is_file() {
+            // Copy a single file
+            if let Some(parent) = dest_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::copy(&source_path, &dest_path).await?;
+            Ok(format!(
+                "✅ Successfully copied file:\n   From: {}\n   To:   {}",
+                source_path.display(),
+                dest_path.display()
+            ))
+        } else if source_path.is_dir() {
+            if !recursive {
+                return Err(ToolError::InvalidInput(
+                    "Source is a directory. Set recursive=true to copy directories.".to_string(),
+                ));
+            }
+
+            // Copy directory recursively
+            let mut files_copied = 0;
+            let mut dirs_created = 0;
+
+            self.copy_dir_recursive(&source_path, &dest_path, &mut files_copied, &mut dirs_created)
+                .await?;
+
+            Ok(format!(
+                "✅ Successfully copied directory:\n   From: {}\n   To:   {}\n   {} files copied, {} directories created",
+                source_path.display(),
+                dest_path.display(),
+                files_copied,
+                dirs_created
+            ))
+        } else {
+            Err(ToolError::InvalidInput(format!(
+                "Source is neither a file nor a directory: {}",
+                source_path.display()
+            )))
+        }
+    }
+
+    /// Recursively copy a directory
+    fn copy_dir_recursive<'a>(
+        &'a self,
+        source: &'a Path,
+        destination: &'a Path,
+        files_copied: &'a mut usize,
+        dirs_created: &'a mut usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+        Box::pin(async move {
+            // Create destination directory
+            if !destination.exists() {
+                tokio::fs::create_dir(destination).await?;
+                *dirs_created += 1;
+            }
+
+            // Read source directory
+            let mut entries = tokio::fs::read_dir(source).await?;
+
+            while let Some(entry) = entries.next_entry().await? {
+                let source_path = entry.path();
+                let file_name = entry.file_name();
+                let dest_path = destination.join(&file_name);
+
+                if source_path.is_file() {
+                    tokio::fs::copy(&source_path, &dest_path).await?;
+                    *files_copied += 1;
+                } else if source_path.is_dir() {
+                    self.copy_dir_recursive(&source_path, &dest_path, files_copied, dirs_created)
+                        .await?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Execute the Delete tool
+    async fn execute_delete(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let path_str = input["path"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing path".to_string()))?;
+
+        let recursive = input["recursive"].as_bool().unwrap_or(false);
+
+        // Resolve path
+        let path = Path::new(path_str);
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_directory.join(path)
+        };
+
+        // Check if path exists
+        if !absolute_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "Path does not exist: {}",
+                absolute_path.display()
+            )));
+        }
+
+        // Perform the deletion
+        if absolute_path.is_file() {
+            // Delete a single file
+            tokio::fs::remove_file(&absolute_path).await?;
+            Ok(format!(
+                "✅ Successfully deleted file: {}",
+                absolute_path.display()
+            ))
+        } else if absolute_path.is_dir() {
+            if !recursive {
+                return Err(ToolError::InvalidInput(
+                    "Path is a directory. Set recursive=true to delete directories and their contents.".to_string(),
+                ));
+            }
+
+            // Count items before deletion
+            let mut files_deleted = 0;
+            let mut dirs_deleted = 0;
+            self.count_items(&absolute_path, &mut files_deleted, &mut dirs_deleted)
+                .await?;
+
+            // Delete directory recursively
+            tokio::fs::remove_dir_all(&absolute_path).await?;
+
+            Ok(format!(
+                "✅ Successfully deleted directory: {}\n   {} files and {} directories removed",
+                absolute_path.display(),
+                files_deleted,
+                dirs_deleted
+            ))
+        } else {
+            Err(ToolError::InvalidInput(format!(
+                "Path is neither a file nor a directory: {}",
+                absolute_path.display()
+            )))
+        }
+    }
+
+    /// Count files and directories recursively
+    fn count_items<'a>(
+        &'a self,
+        path: &'a Path,
+        files: &'a mut usize,
+        dirs: &'a mut usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+        Box::pin(async move {
+            if path.is_file() {
+                *files += 1;
+            } else if path.is_dir() {
+                *dirs += 1;
+                let mut entries = tokio::fs::read_dir(path).await?;
+
+                while let Some(entry) = entries.next_entry().await? {
+                    let entry_path = entry.path();
+                    self.count_items(&entry_path, files, dirs).await?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Execute the Move tool
+    async fn execute_move(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let source_str = input["source"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing source".to_string()))?;
+
+        let destination_str = input["destination"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing destination".to_string()))?;
+
+        let overwrite = input["overwrite"].as_bool().unwrap_or(false);
+
+        // Resolve source path
+        let source = Path::new(source_str);
+        let source_path = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            self.working_directory.join(source)
+        };
+
+        // Check if source exists
+        if !source_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "Source does not exist: {}",
+                source_path.display()
+            )));
+        }
+
+        // Resolve destination path
+        let destination = Path::new(destination_str);
+        let dest_path = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            self.working_directory.join(destination)
+        };
+
+        // Check if destination exists and handle overwrite
+        if dest_path.exists() && !overwrite {
+            return Err(ToolError::InvalidInput(format!(
+                "Destination already exists: {}. Set overwrite=true to replace it.",
+                dest_path.display()
+            )));
+        }
+
+        // If destination exists and overwrite is true, remove it first
+        if dest_path.exists() && overwrite {
+            if dest_path.is_file() {
+                tokio::fs::remove_file(&dest_path).await?;
+            } else if dest_path.is_dir() {
+                tokio::fs::remove_dir_all(&dest_path).await?;
+            }
+        }
+
+        // Determine what we're moving (for feedback)
+        let is_dir = source_path.is_dir();
+        let item_type = if is_dir { "directory" } else { "file" };
+
+        // Perform the move
+        tokio::fs::rename(&source_path, &dest_path).await?;
+
+        Ok(format!(
+            "✅ Successfully moved {} from:\n   {}\n   to:\n   {}",
+            item_type,
+            source_path.display(),
+            dest_path.display()
+        ))
+    }
 }
 
 /// Directory entry information
@@ -2748,5 +3026,599 @@ fn main() {
 
         let result = executor.execute(&tool_use).await;
         assert_eq!(result.is_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_copy_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("source.txt");
+        let dest = temp_dir.path().join("dest.txt");
+        tokio::fs::write(&source, "test content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "dest.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully copied file"));
+
+        // Verify file was copied
+        let dest_content = tokio::fs::read_to_string(&dest).await.unwrap();
+        assert_eq!(dest_content, "test content");
+    }
+
+    #[tokio::test]
+    async fn test_copy_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        let dest_dir = temp_dir.path().join("dest");
+
+        // Create source directory with files
+        tokio::fs::create_dir(&source_dir).await.unwrap();
+        tokio::fs::write(source_dir.join("file1.txt"), "content1").await.unwrap();
+        tokio::fs::write(source_dir.join("file2.txt"), "content2").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source",
+                "destination": "dest"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully copied directory"));
+        assert!(result.content.contains("2 files copied"));
+
+        // Verify files were copied
+        assert!(dest_dir.join("file1.txt").exists());
+        assert!(dest_dir.join("file2.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_copy_nested_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        let nested_dir = source_dir.join("nested");
+        let dest_dir = temp_dir.path().join("dest");
+
+        // Create nested directory structure
+        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+        tokio::fs::write(source_dir.join("file1.txt"), "content1").await.unwrap();
+        tokio::fs::write(nested_dir.join("file2.txt"), "content2").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source",
+                "destination": "dest"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+
+        // Verify nested structure was copied
+        assert!(dest_dir.join("file1.txt").exists());
+        assert!(dest_dir.join("nested").exists());
+        assert!(dest_dir.join("nested/file2.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_copy_overwrite_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("source.txt");
+        let dest = temp_dir.path().join("dest.txt");
+        tokio::fs::write(&source, "new content").await.unwrap();
+        tokio::fs::write(&dest, "existing content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "dest.txt",
+                "overwrite": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("already exists"));
+
+        // Verify destination was not overwritten
+        let dest_content = tokio::fs::read_to_string(&dest).await.unwrap();
+        assert_eq!(dest_content, "existing content");
+    }
+
+    #[tokio::test]
+    async fn test_copy_overwrite_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("source.txt");
+        let dest = temp_dir.path().join("dest.txt");
+        tokio::fs::write(&source, "new content").await.unwrap();
+        tokio::fs::write(&dest, "existing content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "dest.txt",
+                "overwrite": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+
+        // Verify destination was overwritten
+        let dest_content = tokio::fs::read_to_string(&dest).await.unwrap();
+        assert_eq!(dest_content, "new content");
+    }
+
+    #[tokio::test]
+    async fn test_copy_source_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "nonexistent.txt",
+                "destination": "dest.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_copy_missing_parameters() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing destination"));
+    }
+
+    #[tokio::test]
+    async fn test_copy_directory_non_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        tokio::fs::create_dir(&source_dir).await.unwrap();
+        tokio::fs::write(source_dir.join("file.txt"), "content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source",
+                "destination": "dest",
+                "recursive": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Set recursive=true"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        tokio::fs::write(&file_path, "test content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "test.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully deleted file"));
+
+        // Verify file was deleted
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("testdir");
+        tokio::fs::create_dir(&dir_path).await.unwrap();
+        tokio::fs::write(dir_path.join("file1.txt"), "content1").await.unwrap();
+        tokio::fs::write(dir_path.join("file2.txt"), "content2").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "testdir",
+                "recursive": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully deleted directory"));
+        assert!(result.content.contains("2 files"));
+
+        // Verify directory was deleted
+        assert!(!dir_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_nested_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("testdir");
+        let nested_dir = dir_path.join("nested");
+        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+        tokio::fs::write(dir_path.join("file1.txt"), "content1").await.unwrap();
+        tokio::fs::write(nested_dir.join("file2.txt"), "content2").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "testdir",
+                "recursive": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+
+        // Verify directory and nested contents were deleted
+        assert!(!dir_path.exists());
+        assert!(!nested_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_non_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("testdir");
+        tokio::fs::create_dir(&dir_path).await.unwrap();
+        tokio::fs::write(dir_path.join("file.txt"), "content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "testdir",
+                "recursive": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Set recursive=true"));
+
+        // Verify directory was NOT deleted
+        assert!(dir_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_path_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "nonexistent.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_missing_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing path"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_empty_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("emptydir");
+        tokio::fs::create_dir(&dir_path).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "emptydir",
+                "recursive": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully deleted directory"));
+
+        // Verify directory was deleted
+        assert!(!dir_path.exists());
+    }
+
+    // Move Tool Tests
+
+    #[tokio::test]
+    async fn test_move_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let dest_file = temp_dir.path().join("destination.txt");
+
+        tokio::fs::write(&source_file, "test content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "destination.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully moved file"));
+
+        // Verify source no longer exists and destination has content
+        assert!(!source_file.exists());
+        assert!(dest_file.exists());
+        let content = tokio::fs::read_to_string(&dest_file).await.unwrap();
+        assert_eq!(content, "test content");
+    }
+
+    #[tokio::test]
+    async fn test_move_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source_dir");
+        let dest_dir = temp_dir.path().join("dest_dir");
+
+        tokio::fs::create_dir(&source_dir).await.unwrap();
+        tokio::fs::write(source_dir.join("file.txt"), "content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "source_dir",
+                "destination": "dest_dir"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully moved directory"));
+
+        // Verify source no longer exists and destination exists with content
+        assert!(!source_dir.exists());
+        assert!(dest_dir.exists());
+        assert!(dest_dir.join("file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_move_rename_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("oldname.txt");
+        let dest_file = temp_dir.path().join("newname.txt");
+
+        tokio::fs::write(&source_file, "test content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "oldname.txt",
+                "destination": "newname.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully moved file"));
+
+        // Verify rename worked
+        assert!(!source_file.exists());
+        assert!(dest_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_move_overwrite_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let dest_file = temp_dir.path().join("dest.txt");
+
+        tokio::fs::write(&source_file, "source content").await.unwrap();
+        tokio::fs::write(&dest_file, "dest content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "dest.txt",
+                "overwrite": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("already exists"));
+
+        // Verify both files still exist unchanged
+        assert!(source_file.exists());
+        assert!(dest_file.exists());
+        let dest_content = tokio::fs::read_to_string(&dest_file).await.unwrap();
+        assert_eq!(dest_content, "dest content");
+    }
+
+    #[tokio::test]
+    async fn test_move_overwrite_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let dest_file = temp_dir.path().join("dest.txt");
+
+        tokio::fs::write(&source_file, "source content").await.unwrap();
+        tokio::fs::write(&dest_file, "dest content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "dest.txt",
+                "overwrite": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully moved file"));
+
+        // Verify source is gone and dest has source content
+        assert!(!source_file.exists());
+        assert!(dest_file.exists());
+        let dest_content = tokio::fs::read_to_string(&dest_file).await.unwrap();
+        assert_eq!(dest_content, "source content");
+    }
+
+    #[tokio::test]
+    async fn test_move_source_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "nonexistent.txt",
+                "destination": "dest.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_move_missing_parameters() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Missing destination
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "file.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing destination"));
+
+        // Missing source
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "destination": "file.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing source"));
+    }
+
+    #[tokio::test]
+    async fn test_move_to_subdirectory() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let subdir = temp_dir.path().join("subdir");
+        let dest_file = subdir.join("dest.txt");
+
+        tokio::fs::write(&source_file, "test content").await.unwrap();
+        tokio::fs::create_dir(&subdir).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "subdir/dest.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Successfully moved file"));
+
+        // Verify move worked
+        assert!(!source_file.exists());
+        assert!(dest_file.exists());
+        let content = tokio::fs::read_to_string(&dest_file).await.unwrap();
+        assert_eq!(content, "test content");
     }
 }

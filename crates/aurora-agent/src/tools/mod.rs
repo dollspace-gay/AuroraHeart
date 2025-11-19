@@ -359,6 +359,84 @@ pub fn code_analysis_tool() -> Tool {
     }
 }
 
+/// Create the Copy tool definition
+pub fn copy_tool() -> Tool {
+    Tool {
+        name: "copy".to_string(),
+        description: "Copy files or directories to a new location. Supports recursive copying of directory trees.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "The source file or directory path to copy"
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "The destination path where the source should be copied"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Whether to overwrite existing files at the destination (default: false)"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "If true, copy directories recursively (default: true)"
+                }
+            },
+            "required": ["source", "destination"]
+        }),
+    }
+}
+
+/// Create the Delete tool definition
+pub fn delete_tool() -> Tool {
+    Tool {
+        name: "delete".to_string(),
+        description: "Delete files or directories. Includes safety checks and requires confirmation for directory deletion.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file or directory to delete"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "If true, delete directories and their contents recursively (default: false)"
+                }
+            },
+            "required": ["path"]
+        }),
+    }
+}
+
+/// Create the Move tool definition
+pub fn move_tool() -> Tool {
+    Tool {
+        name: "move".to_string(),
+        description: "Move or rename files and directories to a new location. Supports cross-directory moves and atomic renames.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "The source file or directory path to move"
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "The destination path where the source should be moved"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Whether to overwrite existing files at the destination (default: false)"
+                }
+            },
+            "required": ["source", "destination"]
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -373,6 +451,9 @@ pub fn all_tools() -> Vec<Tool> {
         syntax_check_tool(),
         code_format_tool(),
         code_analysis_tool(),
+        copy_tool(),
+        delete_tool(),
+        move_tool(),
     ]
 }
 
@@ -429,7 +510,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 14);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -443,6 +524,9 @@ mod tests {
         assert!(tool_names.contains(&"syntax_check".to_string()));
         assert!(tool_names.contains(&"code_format".to_string()));
         assert!(tool_names.contains(&"code_analysis".to_string()));
+        assert!(tool_names.contains(&"copy".to_string()));
+        assert!(tool_names.contains(&"delete".to_string()));
+        assert!(tool_names.contains(&"move".to_string()));
     }
 
     #[test]
