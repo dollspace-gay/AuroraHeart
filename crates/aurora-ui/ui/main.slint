@@ -1,147 +1,350 @@
 // Main window for AuroraHeart IDE
-import { VerticalBox, HorizontalBox, Button, TextEdit, ScrollView } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, Button, TextEdit, ScrollView, ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// File tree item model
+export struct FileTreeItem {
+    name: string,
+    path: string,
+    is-directory: bool,
+}
 
 export component MainWindow inherits Window {
     title: "AuroraHeart IDE";
-    preferred-width: 1200px;
-    preferred-height: 800px;
+    preferred-width: 1400px;
+    preferred-height: 900px;
+    background: Theme.background-dark;
 
+    // Callbacks
     callback open-file();
     callback save-file();
     callback send-message(string);
+    callback file-selected(string);
 
+    // Properties
     in-out property <string> editor-text: "";
     in-out property <string> chat-input: "";
     in-out property <string> chat-output: "";
+    in-out property <string> current-file: "";
+    in-out property <string> project-name: "AuroraHeart";
+    in-out property <string> status-message: "Ready";
+    in-out property <[FileTreeItem]> file-tree-items: [];
 
-    HorizontalBox {
+    VerticalBox {
         padding: 0px;
         spacing: 0px;
 
-        // File tree placeholder
+        // Menu bar / Toolbar
         Rectangle {
-            width: 200px;
-            background: #2b2b2b;
+            height: Theme.toolbar-height;
+            background: Theme.toolbar-background;
 
-            VerticalBox {
-                padding: 10px;
+            HorizontalBox {
+                padding: Theme.padding-small;
+                spacing: Theme.spacing-medium;
+                alignment: start;
+
                 Text {
-                    text: "File Tree";
-                    color: #cccccc;
-                    font-size: 14px;
+                    text: "AuroraHeart";
+                    color: Theme.text-accent;
+                    font-size: Theme.font-size-large;
+                    font-weight: 700;
+                    vertical-alignment: center;
                 }
-                Text {
-                    text: "(Coming soon)";
-                    color: #888888;
-                    font-size: 12px;
+
+                Rectangle {
+                    width: 20px;
+                }
+
+                Button {
+                    text: "Open File";
+                    clicked => { root.open-file(); }
+                }
+
+                Button {
+                    text: "Save";
+                    enabled: root.current-file != "";
+                    clicked => { root.save-file(); }
                 }
             }
         }
 
         // Main content area
-        VerticalBox {
+        HorizontalBox {
             padding: 0px;
             spacing: 0px;
 
-            // Toolbar
+            // File tree sidebar
             Rectangle {
-                height: 40px;
-                background: #333333;
+                width: Theme.sidebar-width;
+                background: Theme.background-light;
 
-                HorizontalBox {
-                    padding: 5px;
-                    spacing: 10px;
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 0px;
 
-                    Button {
-                        text: "Open";
-                        clicked => {
-                            root.open-file();
+                    // Sidebar header
+                    Rectangle {
+                        height: 32px;
+                        background: Theme.background-light;
+
+                        HorizontalBox {
+                            padding-left: Theme.padding-medium;
+                            padding-right: Theme.padding-medium;
+
+                            Text {
+                                text: "FILES";
+                                color: Theme.text-secondary;
+                                font-size: Theme.font-size-small;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
                         }
                     }
 
-                    Button {
-                        text: "Save";
-                        clicked => {
-                            root.save-file();
+                    // File tree
+                    Rectangle {
+                        background: Theme.background-light;
+
+                        if file-tree-items.length > 0: ListView {
+                            for item in file-tree-items: Rectangle {
+                                height: 24px;
+                                background: touch-area.has-hover ? Theme.selection-background : transparent;
+
+                                touch-area := TouchArea {
+                                    clicked => {
+                                        if !item.is-directory {
+                                            root.file-selected(item.path);
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    padding-left: Theme.padding-medium;
+                                    padding-right: Theme.padding-medium;
+                                    spacing: Theme.spacing-small;
+
+                                    Text {
+                                        text: item.is-directory ? "📁" : "📄";
+                                        font-size: Theme.font-size-small;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: item.name;
+                                        color: Theme.text-primary;
+                                        font-size: Theme.font-size-small;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        if file-tree-items.length == 0: VerticalBox {
+                            padding: Theme.padding-medium;
+                            alignment: start;
+
+                            Text {
+                                text: "No files loaded";
+                                color: Theme.text-secondary;
+                                font-size: Theme.font-size-small;
+                            }
+
+                            Text {
+                                text: "Open a file to get started";
+                                color: Theme.text-secondary;
+                                font-size: Theme.font-size-small;
+                            }
                         }
                     }
                 }
             }
 
-            // Editor and Chat split view
-            HorizontalBox {
+            // Editor and chat area
+            VerticalBox {
                 padding: 0px;
                 spacing: 0px;
 
-                // Editor pane
-                Rectangle {
-                    background: #1e1e1e;
+                // Editor and chat split
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 0px;
 
-                    VerticalBox {
-                        padding: 10px;
+                    // Editor pane
+                    Rectangle {
+                        background: Theme.background-dark;
 
-                        Text {
-                            text: "Editor";
-                            color: #cccccc;
-                            font-size: 14px;
+                        VerticalBox {
+                            padding: 0px;
+                            spacing: 0px;
+
+                            // Editor header
+                            if root.current-file != "": Rectangle {
+                                height: 32px;
+                                background: Theme.background-medium;
+
+                                HorizontalBox {
+                                    padding-left: Theme.padding-medium;
+                                    padding-right: Theme.padding-medium;
+
+                                    Text {
+                                        text: root.current-file;
+                                        color: Theme.text-primary;
+                                        font-size: Theme.font-size-small;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // Editor content
+                            Rectangle {
+                                background: Theme.background-dark;
+
+                                if root.current-file != "" || root.editor-text != "": VerticalBox {
+                                    padding: Theme.padding-medium;
+
+                                    TextEdit {
+                                        text <=> root.editor-text;
+                                        font-size: Theme.font-size-normal;
+                                    }
+                                }
+
+                                if root.current-file == "" && root.editor-text == "": VerticalBox {
+                                    alignment: center;
+
+                                    Text {
+                                        text: "Welcome to AuroraHeart IDE";
+                                        color: Theme.text-accent;
+                                        font-size: 20px;
+                                        font-weight: 600;
+                                    }
+
+                                    Text {
+                                        text: "Your AI-powered development environment";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.font-size-normal;
+                                    }
+
+                                    Rectangle { height: 20px; }
+
+                                    Text {
+                                        text: "Open a file or start coding to begin";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.font-size-small;
+                                    }
+                                }
+                            }
                         }
+                    }
 
-                        TextEdit {
-                            text <=> root.editor-text;
-                            font-size: 14px;
+                    // Chat panel
+                    Rectangle {
+                        width: Theme.chat-panel-width;
+                        background: Theme.background-medium;
+
+                        VerticalBox {
+                            padding: 0px;
+                            spacing: 0px;
+
+                            // Chat header
+                            Rectangle {
+                                height: 32px;
+                                background: Theme.background-medium;
+
+                                HorizontalBox {
+                                    padding-left: Theme.padding-medium;
+                                    padding-right: Theme.padding-medium;
+
+                                    Text {
+                                        text: "AI ASSISTANT";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.font-size-small;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // Chat output
+                            Rectangle {
+                                background: Theme.background-dark;
+
+                                ScrollView {
+                                    VerticalBox {
+                                        padding: Theme.padding-medium;
+
+                                        Text {
+                                            text: root.chat-output;
+                                            color: Theme.text-primary;
+                                            font-size: Theme.font-size-normal;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Chat input
+                            Rectangle {
+                                height: 80px;
+                                background: Theme.background-medium;
+
+                                VerticalBox {
+                                    padding: Theme.padding-medium;
+                                    spacing: Theme.spacing-small;
+
+                                    TextEdit {
+                                        text <=> root.chat-input;
+                                        font-size: Theme.font-size-normal;
+                                        placeholder-text: "Ask Claude for help...";
+                                        height: 40px;
+                                    }
+
+                                    HorizontalBox {
+                                        alignment: end;
+
+                                        Button {
+                                            text: "Send";
+                                            enabled: root.chat-input != "";
+                                            clicked => {
+                                                root.send-message(root.chat-input);
+                                                root.chat-input = "";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            }
+        }
 
-                // Chat panel
+        // Status bar
+        Rectangle {
+            height: Theme.statusbar-height;
+            background: Theme.toolbar-background;
+
+            HorizontalBox {
+                padding-left: Theme.padding-medium;
+                padding-right: Theme.padding-medium;
+                spacing: Theme.spacing-medium;
+
+                Text {
+                    text: root.project-name;
+                    color: Theme.text-accent;
+                    font-size: Theme.font-size-small;
+                    vertical-alignment: center;
+                }
+
                 Rectangle {
-                    width: 400px;
-                    background: #252526;
+                    width: 20px;
+                }
 
-                    VerticalBox {
-                        padding: 10px;
-                        spacing: 10px;
-
-                        Text {
-                            text: "AI Assistant (Claude)";
-                            color: #cccccc;
-                            font-size: 14px;
-                        }
-
-                        // Chat output
-                        Rectangle {
-                            background: #1e1e1e;
-                            border-radius: 5px;
-
-                            ScrollView {
-                                Text {
-                                    text: root.chat-output;
-                                    color: #cccccc;
-                                    font-size: 13px;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-
-                        // Chat input
-                        HorizontalBox {
-                            spacing: 5px;
-
-                            TextEdit {
-                                text <=> root.chat-input;
-                                font-size: 13px;
-                                placeholder-text: "Ask Claude...";
-                            }
-
-                            Button {
-                                text: "Send";
-                                clicked => {
-                                    root.send-message(root.chat-input);
-                                    root.chat-input = "";
-                                }
-                            }
-                        }
-                    }
+                Text {
+                    text: root.status-message;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-size-small;
+                    vertical-alignment: center;
                 }
             }
         }
