@@ -476,6 +476,145 @@ pub fn build_tool() -> Tool {
     }
 }
 
+/// Create the Test Runner tool definition
+pub fn test_runner_tool() -> Tool {
+    Tool {
+        name: "test_runner".to_string(),
+        description: "Execute tests for various project types with result parsing. Supports Rust (cargo test), JavaScript/TypeScript (npm test), Python (pytest), Go (go test), and custom test commands.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "project_type": {
+                    "type": "string",
+                    "description": "Optional project type override (rust, javascript, typescript, python, go, custom). If not specified, detected from project structure.",
+                    "enum": ["rust", "javascript", "typescript", "python", "go", "custom"]
+                },
+                "test_type": {
+                    "type": "string",
+                    "description": "Type of tests to run: 'unit', 'integration', or 'all' (default: 'all')",
+                    "enum": ["unit", "integration", "all"]
+                },
+                "test_pattern": {
+                    "type": "string",
+                    "description": "Optional pattern to filter which tests to run (e.g., test name, file pattern)"
+                },
+                "custom_command": {
+                    "type": "string",
+                    "description": "Custom test command to execute (used when project_type is 'custom')"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Additional arguments to pass to the test command"
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Working directory for the tests (defaults to current directory)"
+                }
+            },
+            "required": []
+        }),
+    }
+}
+
+/// Create the Lint tool definition
+pub fn lint_tool() -> Tool {
+    Tool {
+        name: "lint".to_string(),
+        description: "Run code linters for various project types. Supports Rust (cargo clippy), JavaScript/TypeScript (eslint), Python (pylint/flake8), Go (go vet), and custom lint commands.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "project_type": {
+                    "type": "string",
+                    "description": "Optional project type override (rust, javascript, typescript, python, go, custom). If not specified, detected from project structure.",
+                    "enum": ["rust", "javascript", "typescript", "python", "go", "custom"]
+                },
+                "severity": {
+                    "type": "string",
+                    "description": "Minimum severity level: 'error', 'warning', or 'all' (default: 'all')",
+                    "enum": ["error", "warning", "all"]
+                },
+                "fix": {
+                    "type": "boolean",
+                    "description": "Attempt to automatically fix issues (if supported by linter)"
+                },
+                "custom_command": {
+                    "type": "string",
+                    "description": "Custom lint command to execute (used when project_type is 'custom')"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Additional arguments to pass to the lint command"
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Working directory for linting (defaults to current directory)"
+                }
+            },
+            "required": []
+        }),
+    }
+}
+
+/// Create the Task tool definition
+pub fn task_tool() -> Tool {
+    Tool {
+        name: "task".to_string(),
+        description: "Execute multiple operations as a single task with support for sequential or parallel execution. Useful for complex multi-step operations that need coordination and result aggregation.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Overall description of what this task accomplishes"
+                },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Name/description of this step"
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Command to execute for this step"
+                            },
+                            "working_directory": {
+                                "type": "string",
+                                "description": "Optional working directory for this step"
+                            }
+                        },
+                        "required": ["name", "command"]
+                    },
+                    "description": "List of steps to execute in order"
+                },
+                "execution_mode": {
+                    "type": "string",
+                    "description": "How to execute steps: 'sequential' (one after another) or 'parallel' (all at once)",
+                    "enum": ["sequential", "parallel"]
+                },
+                "stop_on_error": {
+                    "type": "boolean",
+                    "description": "If true, stop executing remaining steps when one fails (default: true for sequential, false for parallel)"
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Default working directory for all steps (can be overridden per step)"
+                }
+            },
+            "required": ["description", "steps"]
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -494,6 +633,9 @@ pub fn all_tools() -> Vec<Tool> {
         delete_tool(),
         move_tool(),
         build_tool(),
+        test_runner_tool(),
+        lint_tool(),
+        task_tool(),
     ]
 }
 
@@ -550,7 +692,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 17);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -568,6 +710,8 @@ mod tests {
         assert!(tool_names.contains(&"delete".to_string()));
         assert!(tool_names.contains(&"move".to_string()));
         assert!(tool_names.contains(&"build".to_string()));
+        assert!(tool_names.contains(&"test_runner".to_string()));
+        assert!(tool_names.contains(&"lint".to_string()));
     }
 
     #[test]

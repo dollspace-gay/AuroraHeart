@@ -70,6 +70,8 @@ impl ToolExecutor {
             "delete" => self.execute_delete(&tool_use.input).await,
             "move" => self.execute_move(&tool_use.input).await,
             "build" => self.execute_build(&tool_use.input).await,
+            "test_runner" => self.execute_test_runner(&tool_use.input).await,
+            "lint" => self.execute_lint(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -1912,6 +1914,516 @@ impl ToolExecutor {
                 project_type
             ))),
         }
+    }
+
+    /// Execute the Test Runner tool
+    async fn execute_test_runner(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let test_type = input["test_type"].as_str().unwrap_or("all");
+        let test_pattern = input["test_pattern"].as_str();
+        let custom_command = input["custom_command"].as_str();
+
+        // Get working directory
+        let working_dir = if let Some(wd) = input["working_directory"].as_str() {
+            let path = Path::new(wd);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.working_directory.join(path)
+            }
+        } else {
+            self.working_directory.clone()
+        };
+
+        // Detect or use specified project type
+        let project_type = if let Some(pt) = input["project_type"].as_str() {
+            pt.to_lowercase()
+        } else {
+            self.detect_test_project_type(&working_dir)?
+        };
+
+        // Build the test command
+        let mut command = if project_type == "custom" {
+            if let Some(cmd) = custom_command {
+                cmd.to_string()
+            } else {
+                return Err(ToolError::InvalidInput(
+                    "custom_command is required when project_type is 'custom'".to_string(),
+                ));
+            }
+        } else {
+            self.get_test_command(&project_type, test_type, test_pattern)?
+        };
+
+        // Add additional arguments
+        if let Some(args) = input["args"].as_array() {
+            for arg in args {
+                if let Some(arg_str) = arg.as_str() {
+                    command.push(' ');
+                    command.push_str(arg_str);
+                }
+            }
+        }
+
+        // Execute the test command
+        let output = tokio::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+            .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+            .arg(&command)
+            .current_dir(&working_dir)
+            .output()
+            .await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Parse test results
+        let test_results = self.parse_test_results(&project_type, &stdout, &stderr);
+
+        if output.status.success() {
+            let mut result = format!("✅ Tests passed ({})\n", project_type);
+            result.push_str(&format!("Command: {}\n", command));
+            result.push_str(&test_results);
+            Ok(result)
+        } else {
+            let mut error_msg = format!("❌ Tests failed ({})\n", project_type);
+            error_msg.push_str(&format!("Command: {}\n", command));
+            error_msg.push_str(&test_results);
+            Err(ToolError::CommandFailed(error_msg))
+        }
+    }
+
+    /// Detect project type for testing
+    fn detect_test_project_type(&self, path: &Path) -> Result<String, ToolError> {
+        // Check for Rust project
+        if path.join("Cargo.toml").exists() {
+            return Ok("rust".to_string());
+        }
+
+        // Check for Node.js project
+        if path.join("package.json").exists() {
+            return Ok("javascript".to_string());
+        }
+
+        // Check for Python project with pytest
+        if path.join("setup.py").exists()
+            || path.join("pyproject.toml").exists()
+            || path.join("pytest.ini").exists()
+            || path.join("tests").exists() {
+            return Ok("python".to_string());
+        }
+
+        // Check for Go project
+        if path.join("go.mod").exists() {
+            return Ok("go".to_string());
+        }
+
+        Err(ToolError::InvalidInput(
+            "Could not detect project type. Please specify project_type explicitly.".to_string(),
+        ))
+    }
+
+    /// Get the test command for a given project type
+    fn get_test_command(
+        &self,
+        project_type: &str,
+        test_type: &str,
+        test_pattern: Option<&str>,
+    ) -> Result<String, ToolError> {
+        match project_type {
+            "rust" => {
+                let mut cmd = String::from("cargo test");
+
+                match test_type {
+                    "unit" => cmd.push_str(" --lib"),
+                    "integration" => cmd.push_str(" --test '*'"),
+                    "all" => {}, // default behavior
+                    _ => return Err(ToolError::InvalidInput(format!(
+                        "Invalid test_type for Rust: {}. Use 'unit', 'integration', or 'all'.",
+                        test_type
+                    ))),
+                }
+
+                if let Some(pattern) = test_pattern {
+                    cmd.push_str(&format!(" {}", pattern));
+                }
+
+                Ok(cmd)
+            }
+            "javascript" | "typescript" => {
+                let mut cmd = String::from("npm test");
+
+                if let Some(pattern) = test_pattern {
+                    cmd.push_str(&format!(" -- {}", pattern));
+                }
+
+                Ok(cmd)
+            }
+            "python" => {
+                let mut cmd = String::from("pytest");
+
+                match test_type {
+                    "unit" => cmd.push_str(" tests/unit"),
+                    "integration" => cmd.push_str(" tests/integration"),
+                    "all" => {}, // default behavior
+                    _ => return Err(ToolError::InvalidInput(format!(
+                        "Invalid test_type for Python: {}. Use 'unit', 'integration', or 'all'.",
+                        test_type
+                    ))),
+                }
+
+                if let Some(pattern) = test_pattern {
+                    cmd.push_str(&format!(" -k {}", pattern));
+                }
+
+                Ok(cmd)
+            }
+            "go" => {
+                let mut cmd = String::from("go test");
+
+                if let Some(pattern) = test_pattern {
+                    cmd.push_str(&format!(" -run {}", pattern));
+                }
+
+                cmd.push_str(" ./...");
+
+                Ok(cmd)
+            }
+            _ => Err(ToolError::InvalidInput(format!(
+                "Unsupported project type: {}. Use 'custom' with custom_command instead.",
+                project_type
+            ))),
+        }
+    }
+
+    /// Parse test results from command output
+    fn parse_test_results(&self, project_type: &str, stdout: &str, stderr: &str) -> String {
+        let mut results = String::new();
+
+        match project_type {
+            "rust" => {
+                // Parse Rust test output
+                if let Some(line) = stdout.lines().find(|l| l.contains("test result:")) {
+                    results.push_str("\nTest Summary:\n");
+                    results.push_str(line);
+                    results.push('\n');
+                } else if !stdout.is_empty() {
+                    results.push_str("\nOutput:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            "javascript" | "typescript" => {
+                // Parse npm test output
+                if !stdout.is_empty() {
+                    results.push_str("\nOutput:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            "python" => {
+                // Parse pytest output
+                if let Some(line) = stdout.lines().rev().find(|l| l.contains("passed") || l.contains("failed")) {
+                    results.push_str("\nTest Summary:\n");
+                    results.push_str(line);
+                    results.push('\n');
+                } else if !stdout.is_empty() {
+                    results.push_str("\nOutput:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            "go" => {
+                // Parse Go test output
+                if !stdout.is_empty() {
+                    results.push_str("\nOutput:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            _ => {
+                // Custom or unknown project type
+                if !stdout.is_empty() {
+                    results.push_str("\nOutput:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Execute the Lint tool
+    async fn execute_lint(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let severity = input["severity"].as_str().unwrap_or("all");
+        let fix = input["fix"].as_bool().unwrap_or(false);
+        let custom_command = input["custom_command"].as_str();
+
+        // Get working directory
+        let working_dir = if let Some(wd) = input["working_directory"].as_str() {
+            let path = Path::new(wd);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.working_directory.join(path)
+            }
+        } else {
+            self.working_directory.clone()
+        };
+
+        // Detect or use specified project type
+        let project_type = if let Some(pt) = input["project_type"].as_str() {
+            pt.to_lowercase()
+        } else {
+            self.detect_lint_project_type(&working_dir)?
+        };
+
+        // Build the lint command
+        let mut command = if project_type == "custom" {
+            if let Some(cmd) = custom_command {
+                cmd.to_string()
+            } else {
+                return Err(ToolError::InvalidInput(
+                    "custom_command is required when project_type is 'custom'".to_string(),
+                ));
+            }
+        } else {
+            self.get_lint_command(&project_type, severity, fix)?
+        };
+
+        // Add additional arguments
+        if let Some(args) = input["args"].as_array() {
+            for arg in args {
+                if let Some(arg_str) = arg.as_str() {
+                    command.push(' ');
+                    command.push_str(arg_str);
+                }
+            }
+        }
+
+        // Execute the lint command
+        let output = tokio::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+            .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+            .arg(&command)
+            .current_dir(&working_dir)
+            .output()
+            .await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Parse lint results
+        let lint_results = self.parse_lint_results(&project_type, &stdout, &stderr);
+
+        if output.status.success() {
+            let mut result = format!("✅ Lint check passed ({})\n", project_type);
+            result.push_str(&format!("Command: {}\n", command));
+            result.push_str(&lint_results);
+            Ok(result)
+        } else {
+            let mut error_msg = format!("⚠️  Lint issues found ({})\n", project_type);
+            error_msg.push_str(&format!("Command: {}\n", command));
+            error_msg.push_str(&lint_results);
+            Err(ToolError::CommandFailed(error_msg))
+        }
+    }
+
+    /// Detect project type for linting
+    fn detect_lint_project_type(&self, path: &Path) -> Result<String, ToolError> {
+        // Check for Rust project
+        if path.join("Cargo.toml").exists() {
+            return Ok("rust".to_string());
+        }
+
+        // Check for Node.js project with ESLint
+        if path.join("package.json").exists() {
+            return Ok("javascript".to_string());
+        }
+
+        // Check for Python project
+        if path.join("setup.py").exists()
+            || path.join("pyproject.toml").exists()
+            || path.join(".pylintrc").exists()
+            || path.join("setup.cfg").exists() {
+            return Ok("python".to_string());
+        }
+
+        // Check for Go project
+        if path.join("go.mod").exists() {
+            return Ok("go".to_string());
+        }
+
+        Err(ToolError::InvalidInput(
+            "Could not detect project type. Please specify project_type explicitly.".to_string(),
+        ))
+    }
+
+    /// Get the lint command for a given project type
+    fn get_lint_command(
+        &self,
+        project_type: &str,
+        severity: &str,
+        fix: bool,
+    ) -> Result<String, ToolError> {
+        match project_type {
+            "rust" => {
+                let mut cmd = String::from("cargo clippy");
+
+                match severity {
+                    "error" => cmd.push_str(" -- -D warnings"),
+                    "warning" | "all" => {}, // default behavior
+                    _ => return Err(ToolError::InvalidInput(format!(
+                        "Invalid severity for Rust: {}. Use 'error', 'warning', or 'all'.",
+                        severity
+                    ))),
+                }
+
+                if fix {
+                    cmd.push_str(" --fix");
+                }
+
+                Ok(cmd)
+            }
+            "javascript" | "typescript" => {
+                let mut cmd = String::from("npx eslint .");
+
+                if fix {
+                    cmd.push_str(" --fix");
+                }
+
+                match severity {
+                    "error" => cmd.push_str(" --quiet"),
+                    "warning" | "all" => {}, // default behavior
+                    _ => return Err(ToolError::InvalidInput(format!(
+                        "Invalid severity for JavaScript/TypeScript: {}. Use 'error', 'warning', or 'all'.",
+                        severity
+                    ))),
+                }
+
+                Ok(cmd)
+            }
+            "python" => {
+                let mut cmd = String::from("pylint .");
+
+                if fix {
+                    // pylint doesn't support auto-fix, use autopep8 instead
+                    cmd = String::from("autopep8 --in-place --recursive .");
+                } else {
+                    match severity {
+                        "error" => cmd.push_str(" --errors-only"),
+                        "warning" | "all" => {}, // default behavior
+                        _ => return Err(ToolError::InvalidInput(format!(
+                            "Invalid severity for Python: {}. Use 'error', 'warning', or 'all'.",
+                            severity
+                        ))),
+                    }
+                }
+
+                Ok(cmd)
+            }
+            "go" => {
+                let cmd = if fix {
+                    String::from("gofmt -w .")
+                } else {
+                    String::from("go vet ./...")
+                };
+
+                Ok(cmd)
+            }
+            _ => Err(ToolError::InvalidInput(format!(
+                "Unsupported project type: {}. Use 'custom' with custom_command instead.",
+                project_type
+            ))),
+        }
+    }
+
+    /// Parse lint results from command output
+    fn parse_lint_results(&self, project_type: &str, stdout: &str, stderr: &str) -> String {
+        let mut results = String::new();
+
+        match project_type {
+            "rust" => {
+                // Parse clippy output
+                if !stdout.is_empty() {
+                    results.push_str("\nLint Results:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nWarnings/Errors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            "javascript" | "typescript" => {
+                // Parse ESLint output
+                if !stdout.is_empty() {
+                    results.push_str("\nLint Results:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            "python" => {
+                // Parse pylint output
+                if !stdout.is_empty() {
+                    results.push_str("\nLint Results:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+            "go" => {
+                // Parse go vet output
+                if !stdout.is_empty() {
+                    results.push_str("\nLint Results:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nIssues:\n");
+                    results.push_str(stderr);
+                }
+            }
+            _ => {
+                // Custom or unknown project type
+                if !stdout.is_empty() {
+                    results.push_str("\nOutput:\n");
+                    results.push_str(stdout);
+                }
+
+                if !stderr.is_empty() {
+                    results.push_str("\nErrors:\n");
+                    results.push_str(stderr);
+                }
+            }
+        }
+
+        results
     }
 }
 
@@ -4000,5 +4512,581 @@ version = "0.1.0"
 
         assert!(result.content.contains("rust"));
         assert!(result.content.contains("cargo build"));
+    }
+
+    // Test Runner Tool Tests
+
+    #[tokio::test]
+    async fn test_test_runner_rust_all_tests() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        // The test may fail or pass depending on the project, but it should execute
+        assert!(result.content.contains("cargo test"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_rust_unit_tests() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "test_type": "unit"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo test --lib"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_rust_with_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "test_pattern": "test_foo"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo test test_foo"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_javascript() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a package.json
+        tokio::fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"name": "test", "scripts": {"test": "jest"}}"#
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("npm test"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_python() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a setup.py
+        tokio::fs::write(temp_dir.path().join("setup.py"), "")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("pytest"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_python_with_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a pytest.ini
+        tokio::fs::write(temp_dir.path().join("pytest.ini"), "")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "test_pattern": "test_auth"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("pytest -k test_auth"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_go() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a go.mod
+        tokio::fs::write(temp_dir.path().join("go.mod"), "module test")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("go test"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_custom_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "project_type": "custom",
+                "custom_command": "echo 'Running custom tests'"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("custom tests"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_with_additional_args() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "args": ["--nocapture", "--quiet"]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo test --nocapture --quiet"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_no_project_detected() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Could not detect project type"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_custom_without_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "project_type": "custom"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("custom_command is required"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_with_working_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("subproject");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+
+        // Create Cargo.toml in subdir
+        tokio::fs::write(subdir.join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "working_directory": "subproject"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("rust"));
+        assert!(result.content.contains("cargo test"));
+    }
+
+    #[tokio::test]
+    async fn test_test_runner_integration_tests() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "test_runner".to_string(),
+            input: serde_json::json!({
+                "test_type": "integration"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo test --test"));
+    }
+
+    // Lint Tool Tests
+
+    #[tokio::test]
+    async fn test_lint_rust_default() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo clippy"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_rust_with_fix() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "fix": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo clippy --fix"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_rust_errors_only() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "severity": "error"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo clippy -- -D warnings"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_javascript() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a package.json
+        tokio::fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"name": "test"}"#
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("npx eslint ."));
+    }
+
+    #[tokio::test]
+    async fn test_lint_javascript_with_fix() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a package.json
+        tokio::fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"name": "test"}"#
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "fix": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("npx eslint . --fix"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_python() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a setup.py
+        tokio::fs::write(temp_dir.path().join("setup.py"), "")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("pylint ."));
+    }
+
+    #[tokio::test]
+    async fn test_lint_python_errors_only() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a pyproject.toml
+        tokio::fs::write(temp_dir.path().join("pyproject.toml"), "")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "severity": "error"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("pylint . --errors-only"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_go() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a go.mod
+        tokio::fs::write(temp_dir.path().join("go.mod"), "module test")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("go vet"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_custom_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "project_type": "custom",
+                "custom_command": "echo 'Running custom linter'"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("custom linter"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_with_additional_args() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        tokio::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "args": ["--", "-W", "clippy::all"]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo clippy -- -W clippy::all"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_no_project_detected() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Could not detect project type"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_custom_without_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "project_type": "custom"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("custom_command is required"));
+    }
+
+    #[tokio::test]
+    async fn test_lint_with_working_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("subproject");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+
+        // Create Cargo.toml in subdir
+        tokio::fs::write(subdir.join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({
+                "working_directory": "subproject"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("rust"));
+        assert!(result.content.contains("cargo clippy"));
     }
 }
