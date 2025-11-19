@@ -1,0 +1,31 @@
+[package]
+name = "aurora-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Aurora crates
+aurora-core = { path = "../aurora-core" }
+
+# HTTP client for Anthropic API
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Logging
+tracing.workspace = true
+
+[dev-dependencies]
+tokio-test = "0.4"
