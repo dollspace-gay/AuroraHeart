@@ -1160,7 +1160,7 @@ mod tests {
 
         // Verify request has tools
         assert!(request.tools.is_some());
-        assert_eq!(request.tools.as_ref().unwrap().len(), 17);
+        assert_eq!(request.tools.as_ref().unwrap().len(), 18);
 
         let result = client.send_message(request).await;
         assert!(result.is_ok());
@@ -1252,7 +1252,7 @@ mod tests {
         .with_tools(all_tools());
 
         assert!(request.tools.is_some());
-        assert_eq!(request.tools.as_ref().unwrap().len(), 17);
+        assert_eq!(request.tools.as_ref().unwrap().len(), 18);
 
         // Verify it serializes correctly
         let json = serde_json::to_string(&request).unwrap();
@@ -1274,5 +1274,6 @@ mod tests {
         assert!(json.contains("\"build\""));
         assert!(json.contains("\"test_runner\""));
         assert!(json.contains("\"lint\""));
+        assert!(json.contains("\"task\""));
     }
 }

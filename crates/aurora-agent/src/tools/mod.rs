@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -712,6 +712,7 @@ mod tests {
         assert!(tool_names.contains(&"build".to_string()));
         assert!(tool_names.contains(&"test_runner".to_string()));
         assert!(tool_names.contains(&"lint".to_string()));
+        assert!(tool_names.contains(&"task".to_string()));
     }
 
     #[test]

@@ -72,6 +72,7 @@ impl ToolExecutor {
             "build" => self.execute_build(&tool_use.input).await,
             "test_runner" => self.execute_test_runner(&tool_use.input).await,
             "lint" => self.execute_lint(&tool_use.input).await,
+            "task" => self.execute_task(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -2424,6 +2425,241 @@ impl ToolExecutor {
         }
 
         results
+    }
+
+    /// Execute the Task tool
+    async fn execute_task(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let description = input["description"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing task description".to_string()))?;
+
+        let steps = input["steps"]
+            .as_array()
+            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid steps array".to_string()))?;
+
+        if steps.is_empty() {
+            return Err(ToolError::InvalidInput("Task must have at least one step".to_string()));
+        }
+
+        let execution_mode = input["execution_mode"].as_str().unwrap_or("sequential");
+        let stop_on_error = input["stop_on_error"].as_bool().unwrap_or_else(|| {
+            // Default: stop on error for sequential, continue for parallel
+            execution_mode == "sequential"
+        });
+
+        // Get default working directory
+        let default_working_dir = if let Some(wd) = input["working_directory"].as_str() {
+            let path = Path::new(wd);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.working_directory.join(path)
+            }
+        } else {
+            self.working_directory.clone()
+        };
+
+        let mut result = format!("📋 Task: {}\n", description);
+        result.push_str(&format!("Execution mode: {}\n", execution_mode));
+        result.push_str(&format!("Steps: {}\n\n", steps.len()));
+
+        match execution_mode {
+            "sequential" => {
+                self.execute_steps_sequential(steps, &default_working_dir, stop_on_error, &mut result).await?;
+            }
+            "parallel" => {
+                self.execute_steps_parallel(steps, &default_working_dir, &mut result).await?;
+            }
+            _ => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Invalid execution_mode: {}. Use 'sequential' or 'parallel'.",
+                    execution_mode
+                )));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Execute steps sequentially
+    async fn execute_steps_sequential(
+        &self,
+        steps: &[serde_json::Value],
+        default_working_dir: &Path,
+        stop_on_error: bool,
+        result: &mut String,
+    ) -> Result<(), ToolError> {
+        let mut completed = 0;
+        let mut failed = 0;
+
+        for (i, step) in steps.iter().enumerate() {
+            let step_name = step["name"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput(format!("Step {} missing name", i + 1)))?;
+
+            let command = step["command"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput(format!("Step {} missing command", i + 1)))?;
+
+            result.push_str(&format!("▶ Step {}/{}: {}\n", i + 1, steps.len(), step_name));
+
+            // Get working directory for this step
+            let working_dir = if let Some(wd) = step["working_directory"].as_str() {
+                let path = Path::new(wd);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    default_working_dir.join(path)
+                }
+            } else {
+                default_working_dir.to_path_buf()
+            };
+
+            // Execute the command
+            let output = tokio::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+                .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+                .arg(command)
+                .current_dir(&working_dir)
+                .output()
+                .await?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if output.status.success() {
+                result.push_str("  ✅ Success\n");
+                if !stdout.is_empty() {
+                    result.push_str(&format!("  Output: {}\n", stdout.trim()));
+                }
+                completed += 1;
+            } else {
+                result.push_str("  ❌ Failed\n");
+                if !stderr.is_empty() {
+                    result.push_str(&format!("  Error: {}\n", stderr.trim()));
+                }
+                failed += 1;
+
+                if stop_on_error {
+                    result.push_str(&format!("\n⚠️  Stopping execution after step {} (stop_on_error=true)\n", i + 1));
+                    result.push_str(&format!("Summary: {} completed, {} failed, {} skipped\n",
+                        completed, failed, steps.len() - i - 1));
+                    return Err(ToolError::CommandFailed(result.clone()));
+                }
+            }
+        }
+
+        result.push_str(&format!("\n✅ Task completed: {} succeeded, {} failed\n", completed, failed));
+
+        if failed > 0 {
+            return Err(ToolError::CommandFailed(result.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Execute steps in parallel
+    async fn execute_steps_parallel(
+        &self,
+        steps: &[serde_json::Value],
+        default_working_dir: &Path,
+        result: &mut String,
+    ) -> Result<(), ToolError> {
+        use tokio::task::JoinSet;
+
+        let mut join_set = JoinSet::new();
+
+        // Spawn all tasks
+        for (i, step) in steps.iter().enumerate() {
+            let step_name = step["name"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput(format!("Step {} missing name", i + 1)))?
+                .to_string();
+
+            let command = step["command"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput(format!("Step {} missing command", i + 1)))?
+                .to_string();
+
+            // Get working directory for this step
+            let working_dir = if let Some(wd) = step["working_directory"].as_str() {
+                let path = Path::new(wd);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    default_working_dir.join(path)
+                }
+            } else {
+                default_working_dir.to_path_buf()
+            };
+
+            join_set.spawn(async move {
+                let output = tokio::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+                    .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+                    .arg(&command)
+                    .current_dir(&working_dir)
+                    .output()
+                    .await;
+
+                (i, step_name, output)
+            });
+        }
+
+        // Collect results
+        let mut results_vec = Vec::new();
+        while let Some(task_result) = join_set.join_next().await {
+            match task_result {
+                Ok((i, step_name, output_result)) => {
+                    results_vec.push((i, step_name, output_result));
+                }
+                Err(e) => {
+                    return Err(ToolError::CommandFailed(format!("Task join error: {}", e)));
+                }
+            }
+        }
+
+        // Sort results by original index to maintain order in output
+        results_vec.sort_by_key(|(i, _, _)| *i);
+
+        // Format results
+        let mut completed = 0;
+        let mut failed = 0;
+
+        for (i, step_name, output_result) in results_vec {
+            result.push_str(&format!("▶ Step {}/{}: {}\n", i + 1, steps.len(), step_name));
+
+            match output_result {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+
+                    if output.status.success() {
+                        result.push_str("  ✅ Success\n");
+                        if !stdout.is_empty() {
+                            result.push_str(&format!("  Output: {}\n", stdout.trim()));
+                        }
+                        completed += 1;
+                    } else {
+                        result.push_str("  ❌ Failed\n");
+                        if !stderr.is_empty() {
+                            result.push_str(&format!("  Error: {}\n", stderr.trim()));
+                        }
+                        failed += 1;
+                    }
+                }
+                Err(e) => {
+                    result.push_str(&format!("  ❌ Execution error: {}\n", e));
+                    failed += 1;
+                }
+            }
+        }
+
+        result.push_str(&format!("\n✅ Task completed (parallel): {} succeeded, {} failed\n", completed, failed));
+
+        if failed > 0 {
+            return Err(ToolError::CommandFailed(result.clone()));
+        }
+
+        Ok(())
     }
 }
 
@@ -5088,5 +5324,310 @@ version = "0.1.0"
 
         assert!(result.content.contains("rust"));
         assert!(result.content.contains("cargo clippy"));
+    }
+
+    // Task Tool Tests
+
+    #[tokio::test]
+    async fn test_task_sequential_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Create and list files",
+                "execution_mode": "sequential",
+                "steps": [
+                    {
+                        "name": "Create file1",
+                        "command": "echo 'test1' > file1.txt"
+                    },
+                    {
+                        "name": "Create file2",
+                        "command": "echo 'test2' > file2.txt"
+                    },
+                    {
+                        "name": "List files",
+                        "command": if cfg!(target_os = "windows") { "dir /b *.txt" } else { "ls *.txt" }
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Create and list files"));
+        assert!(result.content.contains("sequential"));
+        assert!(result.content.contains("✅"));
+    }
+
+    #[tokio::test]
+    async fn test_task_parallel_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Create files in parallel",
+                "execution_mode": "parallel",
+                "steps": [
+                    {
+                        "name": "Create file1",
+                        "command": "echo 'test1' > file1.txt"
+                    },
+                    {
+                        "name": "Create file2",
+                        "command": "echo 'test2' > file2.txt"
+                    },
+                    {
+                        "name": "Create file3",
+                        "command": "echo 'test3' > file3.txt"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("parallel"));
+        assert!(result.content.contains("3 succeeded"));
+    }
+
+    #[tokio::test]
+    async fn test_task_sequential_stop_on_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Test stop on error",
+                "execution_mode": "sequential",
+                "stop_on_error": true,
+                "steps": [
+                    {
+                        "name": "Success step",
+                        "command": "echo 'success'"
+                    },
+                    {
+                        "name": "Failing step",
+                        "command": "exit 1"
+                    },
+                    {
+                        "name": "Should not run",
+                        "command": "echo 'should not see this'"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Stopping execution"));
+        assert!(result.content.contains("1 skipped"));
+    }
+
+    #[tokio::test]
+    async fn test_task_sequential_continue_on_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Test continue on error",
+                "execution_mode": "sequential",
+                "stop_on_error": false,
+                "steps": [
+                    {
+                        "name": "Success step 1",
+                        "command": "echo 'success1'"
+                    },
+                    {
+                        "name": "Failing step",
+                        "command": "exit 1"
+                    },
+                    {
+                        "name": "Success step 2",
+                        "command": "echo 'success2'"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("2 succeeded, 1 failed"));
+    }
+
+    #[tokio::test]
+    async fn test_task_with_working_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Test with working directory",
+                "working_directory": "subdir",
+                "steps": [
+                    {
+                        "name": "Create file in subdir",
+                        "command": "echo 'test' > file.txt"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(subdir.join("file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_task_per_step_working_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir1 = temp_dir.path().join("subdir1");
+        let subdir2 = temp_dir.path().join("subdir2");
+        tokio::fs::create_dir(&subdir1).await.unwrap();
+        tokio::fs::create_dir(&subdir2).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Test per-step working directories",
+                "steps": [
+                    {
+                        "name": "Create in subdir1",
+                        "command": "echo 'test1' > file1.txt",
+                        "working_directory": "subdir1"
+                    },
+                    {
+                        "name": "Create in subdir2",
+                        "command": "echo 'test2' > file2.txt",
+                        "working_directory": "subdir2"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(subdir1.join("file1.txt").exists());
+        assert!(subdir2.join("file2.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_task_missing_description() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "steps": [
+                    {
+                        "name": "Test",
+                        "command": "echo 'test'"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing task description"));
+    }
+
+    #[tokio::test]
+    async fn test_task_empty_steps() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Empty task",
+                "steps": []
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("at least one step"));
+    }
+
+    #[tokio::test]
+    async fn test_task_invalid_execution_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Test invalid mode",
+                "execution_mode": "invalid",
+                "steps": [
+                    {
+                        "name": "Test",
+                        "command": "echo 'test'"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Invalid execution_mode"));
+    }
+
+    #[tokio::test]
+    async fn test_task_default_execution_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Test default mode",
+                "steps": [
+                    {
+                        "name": "Test",
+                        "command": "echo 'test'"
+                    }
+                ]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("sequential"));
     }
 }
