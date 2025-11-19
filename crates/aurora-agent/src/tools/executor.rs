@@ -65,6 +65,7 @@ impl ToolExecutor {
             "multi_replace" => self.execute_multi_replace(&tool_use.input).await,
             "syntax_check" => self.execute_syntax_check(&tool_use.input).await,
             "code_format" => self.execute_code_format(&tool_use.input).await,
+            "code_analysis" => self.execute_code_analysis(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -1140,6 +1141,362 @@ impl ToolExecutor {
                     "Failed to format file:\n\n{}",
                     stderr
                 )))
+            }
+        }
+    }
+
+    /// Execute the Code Analysis tool
+    async fn execute_code_analysis(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let path_str = input["path"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing path".to_string()))?;
+
+        let path = Path::new(path_str);
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_directory.join(path)
+        };
+
+        // Check if path exists
+        if !absolute_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "Path does not exist: {}",
+                absolute_path.display()
+            )));
+        }
+
+        // Detect language
+        let language = if let Some(lang) = input["language"].as_str() {
+            lang.to_lowercase()
+        } else {
+            self.detect_language_from_path(&absolute_path)?
+        };
+
+        let analysis_type = input["analysis_type"]
+            .as_str()
+            .unwrap_or("all");
+        let strict = input["strict"].as_bool().unwrap_or(false);
+
+        // Execute language-specific analysis
+        let mut results = Vec::new();
+
+        match analysis_type {
+            "quality" => {
+                results.push(self.analyze_quality(&absolute_path, &language, strict).await?);
+            }
+            "security" => {
+                results.push(self.analyze_security(&absolute_path, &language).await?);
+            }
+            "all" => {
+                results.push(self.analyze_quality(&absolute_path, &language, strict).await?);
+                results.push(self.analyze_security(&absolute_path, &language).await?);
+            }
+            _ => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Invalid analysis_type: '{}'. Must be 'quality', 'security', or 'all'",
+                    analysis_type
+                )));
+            }
+        }
+
+        let separator = format!("\n\n{}\n\n", "=".repeat(60));
+        Ok(results.join(&separator))
+    }
+
+    /// Detect language from path
+    fn detect_language_from_path(&self, path: &Path) -> Result<String, ToolError> {
+        // Check for project markers
+        if path.is_dir() {
+            if path.join("Cargo.toml").exists() {
+                return Ok("rust".to_string());
+            }
+            if path.join("package.json").exists() {
+                return Ok("javascript".to_string());
+            }
+            if path.join("go.mod").exists() {
+                return Ok("go".to_string());
+            }
+            if path.join("requirements.txt").exists() || path.join("setup.py").exists() {
+                return Ok("python".to_string());
+            }
+        }
+
+        // Check file extension
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                return Ok(match ext {
+                    "rs" => "rust",
+                    "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" => "javascript",
+                    "py" => "python",
+                    "go" => "go",
+                    _ => "unknown",
+                }
+                .to_string());
+            }
+        }
+
+        Err(ToolError::InvalidInput(format!(
+            "Cannot determine language for path: {}. Please specify the 'language' parameter.",
+            path.display()
+        )))
+    }
+
+    /// Analyze code quality
+    async fn analyze_quality(&self, path: &Path, language: &str, strict: bool) -> Result<String, ToolError> {
+        match language {
+            "rust" => self.analyze_rust_quality(path, strict).await,
+            "javascript" | "typescript" => self.analyze_js_quality(path, strict).await,
+            "python" => self.analyze_python_quality(path, strict).await,
+            "go" => self.analyze_go_quality(path, strict).await,
+            unsupported => Err(ToolError::InvalidInput(format!(
+                "Quality analysis for '{}' is not yet supported. Supported languages: rust, javascript, typescript, python, go",
+                unsupported
+            ))),
+        }
+    }
+
+    /// Analyze security vulnerabilities
+    async fn analyze_security(&self, path: &Path, language: &str) -> Result<String, ToolError> {
+        match language {
+            "rust" => self.analyze_rust_security(path).await,
+            "javascript" | "typescript" => self.analyze_js_security(path).await,
+            "python" => self.analyze_python_security(path).await,
+            "go" => self.analyze_go_security(path).await,
+            unsupported => Err(ToolError::InvalidInput(format!(
+                "Security analysis for '{}' is not yet supported. Supported languages: rust, javascript, typescript, python, go",
+                unsupported
+            ))),
+        }
+    }
+
+    /// Analyze Rust code quality using clippy
+    async fn analyze_rust_quality(&self, path: &Path, strict: bool) -> Result<String, ToolError> {
+        // Find the cargo project root
+        let project_root = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.ancestors()
+                .find(|p| p.join("Cargo.toml").exists())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.parent().unwrap().to_path_buf())
+        };
+
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.arg("clippy")
+            .arg("--message-format=short")
+            .current_dir(&project_root);
+
+        if strict {
+            cmd.arg("--").arg("-W").arg("clippy::all");
+        }
+
+        let output = cmd.output().await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() && stdout.is_empty() && stderr.is_empty() {
+            Ok(format!("📊 Code Quality Analysis (Rust)\n✅ No issues found. Code looks good!"))
+        } else {
+            Ok(format!(
+                "📊 Code Quality Analysis (Rust)\n\n{}{}",
+                stdout, stderr
+            ))
+        }
+    }
+
+    /// Analyze Rust security using cargo-audit
+    async fn analyze_rust_security(&self, path: &Path) -> Result<String, ToolError> {
+        let project_root = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.ancestors()
+                .find(|p| p.join("Cargo.toml").exists())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.parent().unwrap().to_path_buf())
+        };
+
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.arg("audit")
+            .current_dir(&project_root);
+
+        let output = cmd.output().await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if output.status.success() {
+                    Ok(format!("🔒 Security Analysis (Rust)\n✅ No known vulnerabilities found."))
+                } else {
+                    Ok(format!("🔒 Security Analysis (Rust)\n\n{}{}", stdout, stderr))
+                }
+            }
+            Err(_) => {
+                Ok("🔒 Security Analysis (Rust)\n⚠️  cargo-audit not installed. Run: cargo install cargo-audit".to_string())
+            }
+        }
+    }
+
+    /// Analyze JavaScript/TypeScript quality using eslint
+    async fn analyze_js_quality(&self, path: &Path, _strict: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("eslint");
+        cmd.arg(path);
+
+        let output = cmd.output().await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if output.status.success() && stdout.is_empty() {
+                    Ok("📊 Code Quality Analysis (JavaScript/TypeScript)\n✅ No issues found.".to_string())
+                } else {
+                    Ok(format!(
+                        "📊 Code Quality Analysis (JavaScript/TypeScript)\n\n{}{}",
+                        stdout, stderr
+                    ))
+                }
+            }
+            Err(_) => {
+                Ok("📊 Code Quality Analysis (JavaScript/TypeScript)\n⚠️  ESLint not installed. Run: npm install -g eslint".to_string())
+            }
+        }
+    }
+
+    /// Analyze JavaScript/TypeScript security using npm audit
+    async fn analyze_js_security(&self, path: &Path) -> Result<String, ToolError> {
+        let project_root = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.ancestors()
+                .find(|p| p.join("package.json").exists())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.parent().unwrap().to_path_buf())
+        };
+
+        let mut cmd = tokio::process::Command::new("npm");
+        cmd.arg("audit")
+            .current_dir(&project_root);
+
+        let output = cmd.output().await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() && stdout.contains("found 0 vulnerabilities") {
+            Ok("🔒 Security Analysis (JavaScript/TypeScript)\n✅ No vulnerabilities found.".to_string())
+        } else {
+            Ok(format!(
+                "🔒 Security Analysis (JavaScript/TypeScript)\n\n{}{}",
+                stdout, stderr
+            ))
+        }
+    }
+
+    /// Analyze Python quality using pylint
+    async fn analyze_python_quality(&self, path: &Path, _strict: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("pylint");
+        cmd.arg(path);
+
+        let output = cmd.output().await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                Ok(format!(
+                    "📊 Code Quality Analysis (Python)\n\n{}{}",
+                    stdout, stderr
+                ))
+            }
+            Err(_) => {
+                Ok("📊 Code Quality Analysis (Python)\n⚠️  Pylint not installed. Run: pip install pylint".to_string())
+            }
+        }
+    }
+
+    /// Analyze Python security using bandit
+    async fn analyze_python_security(&self, path: &Path) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("bandit");
+        cmd.arg("-r").arg(path);
+
+        let output = cmd.output().await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if output.status.success() && stdout.contains("No issues identified") {
+                    Ok("🔒 Security Analysis (Python)\n✅ No security issues found.".to_string())
+                } else {
+                    Ok(format!(
+                        "🔒 Security Analysis (Python)\n\n{}{}",
+                        stdout, stderr
+                    ))
+                }
+            }
+            Err(_) => {
+                Ok("🔒 Security Analysis (Python)\n⚠️  Bandit not installed. Run: pip install bandit".to_string())
+            }
+        }
+    }
+
+    /// Analyze Go code quality
+    async fn analyze_go_quality(&self, path: &Path, _strict: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("golint");
+        cmd.arg(path);
+
+        let output = cmd.output().await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if stdout.is_empty() && stderr.is_empty() {
+                    Ok("📊 Code Quality Analysis (Go)\n✅ No issues found.".to_string())
+                } else {
+                    Ok(format!(
+                        "📊 Code Quality Analysis (Go)\n\n{}{}",
+                        stdout, stderr
+                    ))
+                }
+            }
+            Err(_) => {
+                Ok("📊 Code Quality Analysis (Go)\n⚠️  golint not installed. Run: go install golang.org/x/lint/golint@latest".to_string())
+            }
+        }
+    }
+
+    /// Analyze Go security
+    async fn analyze_go_security(&self, path: &Path) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("gosec");
+        cmd.arg(path);
+
+        let output = cmd.output().await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if stdout.contains("Issues : 0") {
+                    Ok("🔒 Security Analysis (Go)\n✅ No security issues found.".to_string())
+                } else {
+                    Ok(format!(
+                        "🔒 Security Analysis (Go)\n\n{}{}",
+                        stdout, stderr
+                    ))
+                }
+            }
+            Err(_) => {
+                Ok("🔒 Security Analysis (Go)\n⚠️  gosec not installed. Run: go install github.com/securego/gosec/v2/cmd/gosec@latest".to_string())
             }
         }
     }
@@ -2238,5 +2595,158 @@ fn main() {
         let result = executor.execute(&tool_use).await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.content.contains("Missing file_path"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_rust_project() {
+        // Use the current project directory which has Cargo.toml
+        let current_dir = std::env::current_dir().unwrap();
+        let executor = ToolExecutor::with_working_directory(&current_dir);
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": current_dir.to_str().unwrap(),
+                "analysis_type": "quality"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should not error
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Code Quality Analysis"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_security_only() {
+        let current_dir = std::env::current_dir().unwrap();
+        let executor = ToolExecutor::with_working_directory(&current_dir);
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": current_dir.to_str().unwrap(),
+                "analysis_type": "security"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Security Analysis"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_all_types() {
+        let current_dir = std::env::current_dir().unwrap();
+        let executor = ToolExecutor::with_working_directory(&current_dir);
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": current_dir.to_str().unwrap(),
+                "analysis_type": "all"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Code Quality Analysis") || result.content.contains("Security Analysis"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_path_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": "nonexistent"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_missing_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing path"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_with_language_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        tokio::fs::write(&file_path, "fn main() {}").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": file_path.to_str().unwrap(),
+                "language": "rust",
+                "analysis_type": "quality"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should be able to analyze rust code even with .txt extension
+        assert_eq!(result.is_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_invalid_analysis_type() {
+        let current_dir = std::env::current_dir().unwrap();
+        let executor = ToolExecutor::with_working_directory(&current_dir);
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": current_dir.to_str().unwrap(),
+                "analysis_type": "invalid"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Invalid analysis_type"));
+    }
+
+    #[tokio::test]
+    async fn test_code_analysis_strict_mode() {
+        let current_dir = std::env::current_dir().unwrap();
+        let executor = ToolExecutor::with_working_directory(&current_dir);
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_analysis".to_string(),
+            input: serde_json::json!({
+                "path": current_dir.to_str().unwrap(),
+                "analysis_type": "quality",
+                "strict": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
     }
 }

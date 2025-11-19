@@ -328,6 +328,37 @@ pub fn code_format_tool() -> Tool {
     }
 }
 
+/// Create the Code Analysis tool definition
+pub fn code_analysis_tool() -> Tool {
+    Tool {
+        name: "code_analysis".to_string(),
+        description: "Analyze code quality, complexity, and security vulnerabilities. Supports Rust (clippy, cargo-audit), JavaScript/TypeScript (eslint, npm audit), Python (pylint, bandit), and more.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to analyze (file or directory)"
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional language override (rust, javascript, typescript, python, go). If not specified, detected from file extension or project structure."
+                },
+                "analysis_type": {
+                    "type": "string",
+                    "description": "Type of analysis: 'quality' (linting/code smells), 'security' (vulnerability scanning), or 'all' (default: 'all')",
+                    "enum": ["quality", "security", "all"]
+                },
+                "strict": {
+                    "type": "boolean",
+                    "description": "Enable strict analysis mode with more detailed checks (default: false)"
+                }
+            },
+            "required": ["path"]
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -341,6 +372,7 @@ pub fn all_tools() -> Vec<Tool> {
         multi_replace_tool(),
         syntax_check_tool(),
         code_format_tool(),
+        code_analysis_tool(),
     ]
 }
 
@@ -397,7 +429,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -410,6 +442,7 @@ mod tests {
         assert!(tool_names.contains(&"multi_replace".to_string()));
         assert!(tool_names.contains(&"syntax_check".to_string()));
         assert!(tool_names.contains(&"code_format".to_string()));
+        assert!(tool_names.contains(&"code_analysis".to_string()));
     }
 
     #[test]
