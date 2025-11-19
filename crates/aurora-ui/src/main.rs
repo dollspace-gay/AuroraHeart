@@ -371,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 Ok(StreamEvent::Error { error }) => {
                                     tracing::error!("Stream error: {:?}", error);
-                                    let error_msg = format!("\n\n⚠ Error: {}", error.message);
+                                    let error_msg = format!("\n\n⚠ {}", error.message);
                                     let output_base = new_output.clone();
                                     let accumulated = accumulated_text.clone();
                                     let window_weak_clone = window_weak_async.clone();
@@ -389,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 Err(e) => {
                                     tracing::error!("Stream error: {:?}", e);
-                                    let error_msg = format!("\n\n⚠ Error: {}", e);
+                                    let error_msg = format!("\n\n⚠ {}", e.user_message());
                                     let output_base = new_output.clone();
                                     let accumulated = accumulated_text.clone();
                                     let window_weak_clone = window_weak_async.clone();
@@ -397,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(w) = window_weak_clone.upgrade() {
                                             let display = format!("{}{}{}", output_base, accumulated, error_msg);
                                             w.set_chat_output(display.into());
-                                            w.set_status_message("Connection error".into());
+                                            w.set_status_message("Error".into());
                                         }
                                     });
                                     break;
@@ -407,13 +407,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         tracing::error!("Failed to send message: {:?}", e);
-                        let error_msg = format!("\n\n⚠ Failed to send message: {}", e);
+                        let error_msg = format!("\n\n⚠ {}", e.user_message());
                         let output_base = new_output.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(w) = window_weak_async.upgrade() {
                                 let display = format!("{}{}", output_base, error_msg);
                                 w.set_chat_output(display.into());
-                                w.set_status_message("Failed to connect".into());
+                                w.set_status_message("Failed".into());
                             }
                         });
                     }

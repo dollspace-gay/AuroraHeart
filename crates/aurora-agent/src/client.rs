@@ -23,12 +23,72 @@ pub enum ClientError {
     ApiError(String),
 
     /// Invalid API key
-    #[error("Invalid API key")]
+    #[error("Invalid API key - please check your settings")]
     InvalidApiKey,
 
     /// Rate limit exceeded
-    #[error("Rate limit exceeded")]
+    #[error("Rate limit exceeded - please wait a moment")]
     RateLimitExceeded,
+
+    /// Server error (5xx)
+    #[error("Server error: {0}")]
+    ServerError(String),
+
+    /// Network timeout
+    #[error("Request timed out - please check your connection")]
+    Timeout,
+
+    /// Maximum retries exceeded
+    #[error("Maximum retries exceeded: {0}")]
+    MaxRetriesExceeded(String),
+}
+
+impl ClientError {
+    /// Check if this error is retryable
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Transient errors that should be retried
+            ClientError::RateLimitExceeded => true,
+            ClientError::ServerError(_) => true,
+            ClientError::Timeout => true,
+            ClientError::Http(e) => {
+                // Retry on network errors, timeouts, etc.
+                e.is_timeout() || e.is_connect() || e.is_request()
+            }
+            // Permanent errors that should not be retried
+            ClientError::InvalidApiKey => false,
+            ClientError::ApiError(_) => false,
+            ClientError::JsonParse(_) => false,
+            ClientError::MaxRetriesExceeded(_) => false,
+        }
+    }
+
+    /// Get user-friendly error message
+    pub fn user_message(&self) -> String {
+        match self {
+            ClientError::InvalidApiKey => {
+                "Your API key is invalid. Please update it in Settings.".to_string()
+            }
+            ClientError::RateLimitExceeded => {
+                "You've hit the rate limit. Please wait a moment and try again.".to_string()
+            }
+            ClientError::ServerError(_) => {
+                "The API server is experiencing issues. Please try again in a moment.".to_string()
+            }
+            ClientError::Timeout => {
+                "The request timed out. Please check your internet connection.".to_string()
+            }
+            ClientError::MaxRetriesExceeded(_) => {
+                "Could not complete the request after multiple attempts. Please try again later.".to_string()
+            }
+            ClientError::Http(e) if e.is_connect() => {
+                "Could not connect to the API. Please check your internet connection.".to_string()
+            }
+            ClientError::Http(_) | ClientError::ApiError(_) | ClientError::JsonParse(_) => {
+                format!("An error occurred: {}", self)
+            }
+        }
+    }
 }
 
 /// Anthropic API client
@@ -42,7 +102,7 @@ pub struct AnthropicClient {
 }
 
 /// Request to send to Claude
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageRequest {
     /// Model to use (e.g., "claude-sonnet-4")
     pub model: String,
@@ -264,8 +324,9 @@ impl AnthropicClient {
             let error_text = response.text().await?;
 
             return Err(match status.as_u16() {
-                401 => ClientError::InvalidApiKey,
+                401 | 403 => ClientError::InvalidApiKey,
                 429 => ClientError::RateLimitExceeded,
+                500..=599 => ClientError::ServerError(format!("{}: {}", status, error_text)),
                 _ => ClientError::ApiError(format!("{}: {}", status, error_text)),
             });
         }
@@ -315,8 +376,9 @@ impl AnthropicClient {
             let error_text = response.text().await?;
 
             return Err(match status.as_u16() {
-                401 => ClientError::InvalidApiKey,
+                401 | 403 => ClientError::InvalidApiKey,
                 429 => ClientError::RateLimitExceeded,
+                500..=599 => ClientError::ServerError(format!("{}: {}", status, error_text)),
                 _ => ClientError::ApiError(format!("{}: {}", status, error_text)),
             });
         }
@@ -361,9 +423,79 @@ impl AnthropicClient {
         self.send_message_stream(request).await
     }
 
+    /// Send a message with automatic retries for transient errors
+    pub async fn send_message_with_retry(
+        &self,
+        request: MessageRequest,
+        max_retries: usize,
+    ) -> Result<MessageResponse, ClientError> {
+        retry_with_backoff(max_retries, || self.send_message(request.clone())).await
+    }
+
+    /// Send a conversation with automatic retries
+    pub async fn send_conversation_with_retry(
+        &self,
+        conversation: &Conversation,
+        max_retries: usize,
+    ) -> Result<MessageResponse, ClientError> {
+        let request = MessageRequest::from_conversation(conversation, Self::default_model());
+        self.send_message_with_retry(request, max_retries).await
+    }
+
     /// Get the model name
     pub fn default_model() -> &'static str {
         "claude-sonnet-4-20250514"
+    }
+}
+
+/// Retry a future with exponential backoff
+async fn retry_with_backoff<F, Fut, T>(
+    max_retries: usize,
+    mut f: F,
+) -> Result<T, ClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ClientError>>,
+{
+    let mut attempt = 0;
+
+    loop {
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                // Don't retry if error is not retryable
+                if !e.is_retryable() {
+                    tracing::error!("Non-retryable error: {:?}", e);
+                    return Err(e);
+                }
+
+                attempt += 1;
+                if attempt >= max_retries {
+                    tracing::error!("Max retries ({}) exceeded", max_retries);
+                    return Err(ClientError::MaxRetriesExceeded(e.to_string()));
+                }
+
+                // Exponential backoff: 1s, 2s, 4s, 8s, 16s, ...
+                let delay_ms = 1000 * 2u64.pow(attempt as u32 - 1);
+                let delay_ms = std::cmp::min(delay_ms, 30_000); // Cap at 30 seconds
+
+                // For rate limits, wait longer
+                let delay_ms = if matches!(e, ClientError::RateLimitExceeded) {
+                    std::cmp::max(delay_ms, 5000) // Minimum 5 seconds for rate limits
+                } else {
+                    delay_ms
+                };
+
+                tracing::warn!(
+                    "Attempt {} failed with retryable error, retrying in {}ms: {:?}",
+                    attempt,
+                    delay_ms,
+                    e
+                );
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
     }
 }
 
@@ -432,5 +564,476 @@ mod tests {
         assert_eq!(request.messages[0].content, "Hello");
         assert_eq!(request.messages[1].role, "assistant");
         assert_eq!(request.messages[1].content, "Hi there!");
+    }
+
+    // HTTP mocking tests
+    #[tokio::test]
+    async fn test_send_message_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "test_key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_header("content-type", "application/json")
+            .with_status(200)
+            .with_body(r#"{
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello! How can I help you?"}],
+                "model": "claude-sonnet-4",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 20}
+            }"#)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message(request).await;
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response.model, "claude-sonnet-4");
+        match &response.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "Hello! How can I help you?"),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_message_invalid_api_key() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(401)
+            .with_body(r#"{"error": {"type": "authentication_error", "message": "Invalid API key"}}"#)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("invalid_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message(request).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ClientError::InvalidApiKey => {}
+            e => panic!("Expected InvalidApiKey error, got: {:?}", e),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_message_rate_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(429)
+            .with_body(r#"{"error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}}"#)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message(request).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ClientError::RateLimitExceeded => {}
+            e => panic!("Expected RateLimitExceeded error, got: {:?}", e),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_message_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(500)
+            .with_body(r#"{"error": {"type": "internal_server_error", "message": "Server error"}}"#)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message(request).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ClientError::ServerError(_) => {}
+            e => panic!("Expected ServerError, got: {:?}", e),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_error_is_retryable() {
+        // Retryable errors
+        assert!(ClientError::RateLimitExceeded.is_retryable());
+        assert!(ClientError::ServerError("test".to_string()).is_retryable());
+        assert!(ClientError::Timeout.is_retryable());
+
+        // Non-retryable errors
+        assert!(!ClientError::InvalidApiKey.is_retryable());
+        assert!(!ClientError::ApiError("bad request".to_string()).is_retryable());
+        assert!(!ClientError::JsonParse(serde_json::from_str::<MessageResponse>("invalid").unwrap_err()).is_retryable());
+        assert!(!ClientError::MaxRetriesExceeded("test".to_string()).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn test_error_user_messages() {
+        let invalid_key_error = ClientError::InvalidApiKey;
+        assert!(invalid_key_error.user_message().contains("API key"));
+
+        let rate_limit_error = ClientError::RateLimitExceeded;
+        assert!(rate_limit_error.user_message().contains("rate limit"));
+
+        let server_error = ClientError::ServerError("500".to_string());
+        assert!(server_error.user_message().contains("server"));
+
+        let timeout_error = ClientError::Timeout;
+        assert!(timeout_error.user_message().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_transient_error() {
+        let mut server = mockito::Server::new_async().await;
+
+        // First call fails with 500, second succeeds
+        let mock_fail = server
+            .mock("POST", "/messages")
+            .with_status(500)
+            .with_body(r#"{"error": {"type": "internal_server_error", "message": "Server error"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mock_success = server
+            .mock("POST", "/messages")
+            .with_status(200)
+            .with_body(r#"{
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Success after retry"}],
+                "model": "claude-sonnet-4",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 20}
+            }"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message_with_retry(request, 3).await;
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        match &response.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "Success after retry"),
+        }
+
+        mock_fail.assert_async().await;
+        mock_success.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_retry_fails_with_non_retryable_error() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Returns 401 which is not retryable
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(401)
+            .with_body(r#"{"error": {"type": "authentication_error", "message": "Invalid API key"}}"#)
+            .expect(1)  // Should only be called once, not retried
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("invalid_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message_with_retry(request, 3).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ClientError::InvalidApiKey => {}
+            e => panic!("Expected InvalidApiKey error, got: {:?}", e),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhausted() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Always fails with 500
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(500)
+            .with_body(r#"{"error": {"type": "internal_server_error", "message": "Server error"}}"#)
+            .expect(3)  // Should try 3 times
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message_with_retry(request, 3).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            ClientError::MaxRetriesExceeded(_) => {}
+            e => panic!("Expected MaxRetriesExceeded error, got: {:?}", e),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_streaming_request_setup() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Verify that streaming request includes stream:true parameter
+        let mock = server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "test_key")
+            .match_body(mockito::Matcher::PartialJsonString(r#"{"stream":true}"#.to_string()))
+            .with_status(200)
+            .with_body("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}\n\n")
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message_stream(request).await;
+        // Just verify the stream is created successfully
+        // Detailed streaming parsing is tested in integration tests
+        assert!(result.is_ok());
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_handling() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(401)
+            .with_body(r#"{"error": {"type": "authentication_error", "message": "Invalid API key"}}"#)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("invalid_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        );
+
+        let result = client.send_message_stream(request).await;
+        assert!(result.is_err());
+
+        if let Err(e) = result {
+            match e {
+                ClientError::InvalidApiKey => {}
+                e => panic!("Expected InvalidApiKey error, got: {:?}", e),
+            }
+        }
+
+        mock.assert_async().await;
+    }
+
+    // Integration tests
+    #[tokio::test]
+    async fn test_integration_conversation_to_api_request() {
+        use crate::conversation::Conversation;
+
+        // Create a conversation with multiple messages
+        let mut conversation = Conversation::with_system_prompt("You are a helpful assistant");
+        conversation.add_user_message("Hello!");
+        conversation.add_assistant_message("Hi! How can I help you?");
+        conversation.add_user_message("What's the weather?");
+
+        // Convert to API request
+        let request = MessageRequest::from_conversation(&conversation, "claude-sonnet-4");
+
+        // Verify request structure
+        assert_eq!(request.model, "claude-sonnet-4");
+        assert_eq!(request.system, Some("You are a helpful assistant".to_string()));
+        assert_eq!(request.messages.len(), 3);
+
+        // Verify message order and content
+        assert_eq!(request.messages[0].role, "user");
+        assert_eq!(request.messages[0].content, "Hello!");
+        assert_eq!(request.messages[1].role, "assistant");
+        assert_eq!(request.messages[1].content, "Hi! How can I help you?");
+        assert_eq!(request.messages[2].role, "user");
+        assert_eq!(request.messages[2].content, "What's the weather?");
+    }
+
+    #[tokio::test]
+    async fn test_integration_conversation_truncation_before_api_call() {
+        use crate::conversation::Conversation;
+
+        // Create a conversation with many long messages
+        let mut conversation = Conversation::with_system_prompt("System");
+        for i in 0..10 {
+            conversation.add_user_message(format!("This is a longer user message number {} with more content", i));
+            conversation.add_assistant_message(format!("This is a longer assistant response number {} with more content", i));
+        }
+
+        // Verify we have all messages
+        assert_eq!(conversation.message_count(), 20);
+
+        // Get initial character count
+        let initial_chars = conversation.total_chars();
+        assert!(initial_chars > 400); // Should be well over 400 chars
+
+        // Truncate to fit within a small limit (50 tokens = ~200 chars)
+        let removed = conversation.truncate_to_tokens(50);
+        assert!(removed > 0);
+        assert!(conversation.message_count() < 20);
+
+        // Verify we can still create a valid request
+        let request = MessageRequest::from_conversation(&conversation, "claude-sonnet-4");
+        assert!(request.messages.len() > 0);
+        assert!(request.messages.len() < 20);
+    }
+
+    #[tokio::test]
+    async fn test_integration_end_to_end_message_flow() {
+        use crate::conversation::Conversation;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/messages")
+            .with_status(200)
+            .with_body(r#"{
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I'm doing great, thanks for asking!"}],
+                "model": "claude-sonnet-4",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 15, "output_tokens": 25}
+            }"#)
+            .create_async()
+            .await;
+
+        // 1. Create conversation
+        let mut conversation = Conversation::with_system_prompt("You are a friendly AI");
+        conversation.add_user_message("Hello, how are you?");
+
+        // 2. Create client
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        // 3. Send conversation
+        let result = client.send_conversation_with_retry(&conversation, 3).await;
+        assert!(result.is_ok());
+
+        // 4. Verify response
+        let response = result.unwrap();
+        match &response.content[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "I'm doing great, thanks for asking!");
+            }
+        }
+
+        // 5. Add response to conversation
+        match &response.content[0] {
+            ContentBlock::Text { text } => {
+                conversation.add_assistant_message(text.clone());
+            }
+        }
+
+        // 6. Verify conversation state
+        assert_eq!(conversation.message_count(), 2);
+        assert_eq!(conversation.messages()[0].role, crate::conversation::Role::User);
+        assert_eq!(conversation.messages()[1].role, crate::conversation::Role::Assistant);
+
+        mock.assert_async().await;
     }
 }
