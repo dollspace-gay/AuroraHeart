@@ -1,0 +1,50 @@
+# Clippy configuration for Aurora Compass
+# https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# Warn if docs are missing for public items
+# Note: This is enforced via #![warn(missing_docs)] in lib.rs
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 30
+
+# Maximum number of lines for a function
+too-many-lines-threshold = 150
+
+# Maximum number of arguments for a function
+too-many-arguments-threshold = 8
+
+# Maximum number of public items without docs
+# (individual crates may have stricter requirements)
+missing-docs-in-crate-items = true
+
+# Type complexity threshold
+type-complexity-threshold = 500
+
+# Maximum number of single char bindings
+single-char-binding-names-threshold = 4
+
+# Maximum number of bool parameters
+max-fn-params-bools = 2
+
+# Maximum number of trait bounds
+max-trait-bounds = 5
+
+# Ensure standard library types are used correctly
+standard-macro-braces = [
+    { name = "vec", brace = "[" },
+    { name = "println", brace = "(" },
+    { name = "format", brace = "(" },
+]
+
+# Allowed/Disallowed names
+disallowed-names = ["foo", "bar", "baz", "test"]
+
+# Modules with internal visibility
+# (used for module-level organization)
+allow-mixed-uninlined-format-args = false
+
+# Configure specific lint behaviors
+avoid-breaking-exported-api = true
+
+# Whether to check suggestions for tests
+check-private-items = true
