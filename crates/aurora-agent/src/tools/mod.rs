@@ -234,6 +234,48 @@ pub fn list_directory_tool() -> Tool {
     }
 }
 
+/// Create the Multi-File Replace tool definition
+pub fn multi_replace_tool() -> Tool {
+    Tool {
+        name: "multi_replace".to_string(),
+        description: "Search and replace a pattern across multiple files with preview support.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The regular expression pattern to search for"
+                },
+                "replacement": {
+                    "type": "string",
+                    "description": "The replacement string (can include capture groups like $1, $2)"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The directory to search in (defaults to current directory)"
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "Optional glob pattern to filter files (e.g., '*.rs', '*.{js,ts}')"
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Whether to perform case-insensitive search (default: false)"
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, preview changes without modifying files (default: true)"
+                },
+                "max_files": {
+                    "type": "integer",
+                    "description": "Maximum number of files to process (default: 50)"
+                }
+            },
+            "required": ["pattern", "replacement"]
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -244,6 +286,7 @@ pub fn all_tools() -> Vec<Tool> {
         grep_tool(),
         glob_tool(),
         list_directory_tool(),
+        multi_replace_tool(),
     ]
 }
 
@@ -300,7 +343,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -310,6 +353,7 @@ mod tests {
         assert!(tool_names.contains(&"grep".to_string()));
         assert!(tool_names.contains(&"glob".to_string()));
         assert!(tool_names.contains(&"list_directory".to_string()));
+        assert!(tool_names.contains(&"multi_replace".to_string()));
     }
 
     #[test]

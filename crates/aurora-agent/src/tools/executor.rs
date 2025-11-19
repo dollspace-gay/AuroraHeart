@@ -62,6 +62,7 @@ impl ToolExecutor {
             "grep" => self.execute_grep(&tool_use.input).await,
             "glob" => self.execute_glob(&tool_use.input).await,
             "list_directory" => self.execute_list_directory(&tool_use.input).await,
+            "multi_replace" => self.execute_multi_replace(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -482,6 +483,167 @@ impl ToolExecutor {
                 // Recursively process subdirectories
                 if recursive && is_dir {
                     self.collect_directory_entries(&path, show_hidden, recursive, entries, depth + 1)
+                        .await?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Execute the Multi-File Replace tool
+    async fn execute_multi_replace(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let pattern_str = input["pattern"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing pattern".to_string()))?;
+
+        let replacement = input["replacement"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing replacement".to_string()))?;
+
+        let search_path = input["path"]
+            .as_str()
+            .map(|p| {
+                let path = Path::new(p);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.working_directory.join(path)
+                }
+            })
+            .unwrap_or_else(|| self.working_directory.clone());
+
+        let file_pattern = input["file_pattern"].as_str();
+        let case_insensitive = input["case_insensitive"].as_bool().unwrap_or(false);
+        let dry_run = input["dry_run"].as_bool().unwrap_or(true);
+        let max_files = input["max_files"].as_u64().unwrap_or(50) as usize;
+
+        // Compile the regex pattern
+        let regex_pattern = if case_insensitive {
+            format!("(?i){}", pattern_str)
+        } else {
+            pattern_str.to_string()
+        };
+
+        let regex = Regex::new(&regex_pattern)
+            .map_err(|e| ToolError::InvalidInput(format!("Invalid regex pattern: {}", e)))?;
+
+        // Collect files to process
+        let mut files_to_process = Vec::new();
+        self.collect_files_for_replace(&search_path, file_pattern, &mut files_to_process, max_files)
+            .await?;
+
+        if files_to_process.is_empty() {
+            return Ok("No files found matching the criteria".to_string());
+        }
+
+        // Process each file
+        let mut changes = Vec::new();
+        let mut files_changed = 0;
+        let mut total_replacements = 0;
+
+        for file_path in files_to_process.iter().take(max_files) {
+            // Read file content
+            let content = match tokio::fs::read_to_string(file_path).await {
+                Ok(c) => c,
+                Err(_) => continue, // Skip files that can't be read
+            };
+
+            // Apply replacements
+            let mut replacement_count = 0;
+            let new_content = regex.replace_all(&content, |caps: &regex::Captures| {
+                replacement_count += 1;
+                // Expand capture groups in replacement string
+                let mut result = replacement.to_string();
+                for i in 0..caps.len() {
+                    result = result.replace(&format!("${}", i), caps.get(i).map(|m| m.as_str()).unwrap_or(""));
+                }
+                result
+            });
+
+            // Check if any changes were made
+            if new_content != content {
+                files_changed += 1;
+                total_replacements += replacement_count;
+
+                if dry_run {
+                    // Preview mode - show what would change
+                    changes.push(format!(
+                        "📄 {}\n   {} replacements would be made",
+                        file_path.display(),
+                        replacement_count
+                    ));
+                } else {
+                    // Actually write the changes
+                    tokio::fs::write(file_path, new_content.as_bytes()).await?;
+                    changes.push(format!(
+                        "✅ {}\n   {} replacements made",
+                        file_path.display(),
+                        replacement_count
+                    ));
+                }
+            }
+        }
+
+        // Format the result
+        if changes.is_empty() {
+            Ok(format!(
+                "Searched {} files, no matches found for pattern: {}",
+                files_to_process.len(),
+                pattern_str
+            ))
+        } else {
+            let mode_str = if dry_run { "DRY RUN - Preview of changes" } else { "Changes applied" };
+            Ok(format!(
+                "{}\n\n{} files would be changed with {} total replacements:\n\n{}",
+                mode_str,
+                files_changed,
+                total_replacements,
+                changes.join("\n")
+            ))
+        }
+    }
+
+    /// Recursively collect files for replacement
+    fn collect_files_for_replace<'a>(
+        &'a self,
+        dir_path: &'a Path,
+        file_pattern: Option<&'a str>,
+        files: &'a mut Vec<std::path::PathBuf>,
+        max_files: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+        Box::pin(async move {
+            if files.len() >= max_files {
+                return Ok(());
+            }
+
+            if !dir_path.exists() {
+                return Err(ToolError::InvalidInput(format!(
+                    "Path does not exist: {}",
+                    dir_path.display()
+                )));
+            }
+
+            if dir_path.is_file() {
+                // Check if file matches the file pattern
+                if let Some(pattern) = file_pattern {
+                    if let Some(file_name) = dir_path.file_name().and_then(|n| n.to_str()) {
+                        let glob_pattern = glob::Pattern::new(pattern)
+                            .map_err(|e| ToolError::InvalidInput(format!("Invalid glob pattern: {}", e)))?;
+                        if glob_pattern.matches(file_name) {
+                            files.push(dir_path.to_path_buf());
+                        }
+                    }
+                } else {
+                    files.push(dir_path.to_path_buf());
+                }
+            } else if dir_path.is_dir() {
+                let mut entries = tokio::fs::read_dir(dir_path).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    if files.len() >= max_files {
+                        break;
+                    }
+                    self.collect_files_for_replace(&entry.path(), file_pattern, files, max_files)
                         .await?;
                 }
             }
@@ -1094,5 +1256,176 @@ mod tests {
         let result = executor.execute(&tool_use).await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.content.contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_dry_run() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("test1.txt"), "Hello World\nHello Again").await.unwrap();
+        tokio::fs::write(temp_dir.path().join("test2.txt"), "Hello Everyone").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "Hello",
+                "replacement": "Hi",
+                "dry_run": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("DRY RUN"));
+        assert!(result.content.contains("2 files would be changed"));
+
+        // Verify files weren't actually modified
+        let content1 = tokio::fs::read_to_string(temp_dir.path().join("test1.txt")).await.unwrap();
+        assert_eq!(content1, "Hello World\nHello Again");
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_actual() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("test.txt"), "foo bar foo").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "foo",
+                "replacement": "baz",
+                "dry_run": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Changes applied"));
+        assert!(result.content.contains("1 files would be changed"));
+
+        // Verify file was actually modified
+        let content = tokio::fs::read_to_string(temp_dir.path().join("test.txt")).await.unwrap();
+        assert_eq!(content, "baz bar baz");
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_with_file_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("test.rs"), "fn test() {}").await.unwrap();
+        tokio::fs::write(temp_dir.path().join("test.txt"), "fn test() {}").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "test",
+                "replacement": "example",
+                "file_pattern": "*.rs",
+                "dry_run": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("test.rs"));
+        assert!(!result.content.contains("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_case_insensitive() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("test.txt"), "HELLO hello HeLLo").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "hello",
+                "replacement": "hi",
+                "case_insensitive": true,
+                "dry_run": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("3 total replacements"));
+
+        let content = tokio::fs::read_to_string(temp_dir.path().join("test.txt")).await.unwrap();
+        assert_eq!(content, "hi hi hi");
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_with_capture_groups() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("test.txt"), "name: John, name: Jane").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": r"name: (\w+)",
+                "replacement": "person: $1",
+                "dry_run": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+
+        let content = tokio::fs::read_to_string(temp_dir.path().join("test.txt")).await.unwrap();
+        assert_eq!(content, "person: John, person: Jane");
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_no_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("test.txt"), "Some content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "NotFound",
+                "replacement": "Replaced",
+                "dry_run": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("no matches found"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_max_files() {
+        let temp_dir = TempDir::new().unwrap();
+        // Create 5 files
+        for i in 1..=5 {
+            tokio::fs::write(temp_dir.path().join(format!("test{}.txt", i)), "foo").await.unwrap();
+        }
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "foo",
+                "replacement": "bar",
+                "max_files": 3,
+                "dry_run": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("3 files would be changed"));
     }
 }
