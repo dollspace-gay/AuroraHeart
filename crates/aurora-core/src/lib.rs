@@ -5,17 +5,22 @@
 //! - Configuration management
 //! - Encrypted credential storage
 //! - Shared types and error handling
+//! - File I/O utilities
+//! - Project detection and analysis
 
 pub mod config;
 pub mod crypto;
+pub mod error;
+pub mod file_io;
+pub mod project;
 pub mod types;
 
 pub use config::{Config, ConfigError};
 pub use crypto::{CredentialStore, CredentialStoreError};
+pub use error::{AuroraCoreError, Result};
+pub use file_io::{FileIoError, read_file, read_file_content, write_file, write_file_content};
+pub use project::{Language, ProjectError, detect_language, find_project_root, get_project_name};
 pub use types::*;
-
-/// Result type alias for core operations
-pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
 #[cfg(test)]
 mod tests {
