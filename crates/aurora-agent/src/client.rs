@@ -4,7 +4,9 @@
 //! including support for streaming responses and tool use.
 
 use crate::conversation::{Conversation, Message, Role};
+use crate::tools::{Tool, ToolResult, ToolUse};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 /// Errors that can occur during API client operations
@@ -113,6 +115,9 @@ pub struct MessageRequest {
     /// System prompt (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// Tools available to the model (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
     /// Temperature for sampling (0.0 to 1.0, optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -145,11 +150,74 @@ pub struct MessageResponse {
 }
 
 /// Content block in a response
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: JsonValue,
+    },
+
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+}
+
+impl ContentBlock {
+    /// Check if this is a text block
+    pub fn is_text(&self) -> bool {
+        matches!(self, ContentBlock::Text { .. })
+    }
+
+    /// Check if this is a tool use block
+    pub fn is_tool_use(&self) -> bool {
+        matches!(self, ContentBlock::ToolUse { .. })
+    }
+
+    /// Check if this is a tool result block
+    pub fn is_tool_result(&self) -> bool {
+        matches!(self, ContentBlock::ToolResult { .. })
+    }
+
+    /// Get text content if this is a text block
+    pub fn as_text(&self) -> Option<&str> {
+        if let ContentBlock::Text { text } = self {
+            Some(text)
+        } else {
+            None
+        }
+    }
+
+    /// Convert to a ToolUse struct from crate::tools
+    pub fn as_tool_use(&self) -> Option<ToolUse> {
+        if let ContentBlock::ToolUse { id, name, input } = self {
+            Some(ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Create a ContentBlock from a ToolResult
+    pub fn from_tool_result(result: &ToolResult) -> Self {
+        ContentBlock::ToolResult {
+            tool_use_id: result.tool_use_id.clone(),
+            content: result.content.clone(),
+            is_error: result.is_error,
+        }
+    }
 }
 
 /// Streaming event from Claude API
@@ -235,6 +303,7 @@ impl MessageRequest {
             max_tokens: 4096,
             messages,
             system: None,
+            tools: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -254,10 +323,17 @@ impl MessageRequest {
             max_tokens: 4096,
             messages,
             system: conversation.system_prompt.clone(),
+            tools: None,
             temperature: None,
             top_p: None,
             top_k: None,
         }
+    }
+
+    /// Set the tools available to the model
+    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
+        self.tools = Some(tools);
+        self
     }
 
     /// Set the temperature
@@ -520,6 +596,7 @@ mod tests {
                 content: "Hello!".to_string(),
             }],
             system: Some("You are a helpful assistant.".to_string()),
+            tools: None,
             temperature: Some(0.7),
             top_p: None,
             top_k: None,
@@ -606,6 +683,7 @@ mod tests {
         assert_eq!(response.model, "claude-sonnet-4");
         match &response.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "Hello! How can I help you?"),
+            _ => panic!("Expected text content block"),
         }
 
         mock.assert_async().await;
@@ -782,6 +860,7 @@ mod tests {
         let response = result.unwrap();
         match &response.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "Success after retry"),
+            _ => panic!("Expected text content block"),
         }
 
         mock_fail.assert_async().await;
@@ -1020,6 +1099,7 @@ mod tests {
             ContentBlock::Text { text } => {
                 assert_eq!(text, "I'm doing great, thanks for asking!");
             }
+            _ => panic!("Expected text content block"),
         }
 
         // 5. Add response to conversation
@@ -1027,6 +1107,7 @@ mod tests {
             ContentBlock::Text { text } => {
                 conversation.add_assistant_message(text.clone());
             }
+            _ => panic!("Expected text content block"),
         }
 
         // 6. Verify conversation state
@@ -1035,5 +1116,152 @@ mod tests {
         assert_eq!(conversation.messages()[1].role, crate::conversation::Role::Assistant);
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_tool_use_request() {
+        use crate::tools::all_tools;
+
+        let mut server = mockito::Server::new_async().await;
+
+        // Verify that tools are included in the request and response contains tool_use
+        let mock = server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "test_key")
+            .with_status(200)
+            .with_body(r#"{
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "read",
+                    "input": {"file_path": "/tmp/test.txt"}
+                }],
+                "model": "claude-sonnet-4",
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 10, "output_tokens": 20}
+            }"#)
+            .create_async()
+            .await;
+
+        let mut client = AnthropicClient::new("test_key".to_string());
+        client.base_url = server.url();
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Read the file".to_string(),
+            }],
+        )
+        .with_tools(all_tools());
+
+        // Verify request has tools
+        assert!(request.tools.is_some());
+        assert_eq!(request.tools.as_ref().unwrap().len(), 6);
+
+        let result = client.send_message(request).await;
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response.stop_reason, Some("tool_use".to_string()));
+
+        match &response.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_123");
+                assert_eq!(name, "read");
+                assert_eq!(input["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("Expected tool use content block"),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_content_block_helpers() {
+        // Test is_text
+        let text_block = ContentBlock::Text {
+            text: "Hello".to_string(),
+        };
+        assert!(text_block.is_text());
+        assert!(!text_block.is_tool_use());
+        assert!(!text_block.is_tool_result());
+        assert_eq!(text_block.as_text(), Some("Hello"));
+
+        // Test is_tool_use
+        let tool_use_block = ContentBlock::ToolUse {
+            id: "toolu_123".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"file_path": "/tmp/test.txt"}),
+        };
+        assert!(!tool_use_block.is_text());
+        assert!(tool_use_block.is_tool_use());
+        assert!(!tool_use_block.is_tool_result());
+        assert_eq!(tool_use_block.as_text(), None);
+
+        let tool_use = tool_use_block.as_tool_use().unwrap();
+        assert_eq!(tool_use.id, "toolu_123");
+        assert_eq!(tool_use.name, "read");
+
+        // Test is_tool_result
+        let tool_result_block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_123".to_string(),
+            content: "File contents".to_string(),
+            is_error: None,
+        };
+        assert!(!tool_result_block.is_text());
+        assert!(!tool_result_block.is_tool_use());
+        assert!(tool_result_block.is_tool_result());
+    }
+
+    #[test]
+    fn test_content_block_from_tool_result() {
+        use crate::tools::ToolResult;
+
+        let result = ToolResult::success("toolu_123".to_string(), "Success!".to_string());
+        let block = ContentBlock::from_tool_result(&result);
+
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "toolu_123");
+                assert_eq!(content, "Success!");
+                assert_eq!(is_error, None);
+            }
+            _ => panic!("Expected tool result content block"),
+        }
+    }
+
+    #[test]
+    fn test_message_request_with_tools() {
+        use crate::tools::all_tools;
+
+        let request = MessageRequest::new(
+            "claude-sonnet-4",
+            vec![ApiMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+        )
+        .with_tools(all_tools());
+
+        assert!(request.tools.is_some());
+        assert_eq!(request.tools.as_ref().unwrap().len(), 6);
+
+        // Verify it serializes correctly
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"tools\""));
+        assert!(json.contains("\"read\""));
+        assert!(json.contains("\"write\""));
+        assert!(json.contains("\"edit\""));
+        assert!(json.contains("\"bash\""));
+        assert!(json.contains("\"grep\""));
+        assert!(json.contains("\"glob\""));
     }
 }

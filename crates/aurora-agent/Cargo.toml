@@ -28,9 +28,14 @@ futures = "0.3"
 # Byte manipulation
 bytes = "1.9"
 
+# Pattern matching and search
+regex = "1.11"
+glob = "0.3"
+
 # Logging
 tracing.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
 mockito = "1.6"
+tempfile = "3.15"

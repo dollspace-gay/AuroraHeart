@@ -11,9 +11,10 @@ pub mod tools;
 pub mod conversation;
 pub mod directives;
 
-pub use client::{AnthropicClient, ClientError, StreamEvent, Delta, ApiError};
+pub use client::{AnthropicClient, ClientError, StreamEvent, Delta, ApiError, MessageRequest, MessageResponse, ContentBlock};
 pub use conversation::{Conversation, Message, Role};
 pub use directives::DirectiveManager;
+pub use tools::{Tool, ToolUse, ToolResult, ToolExecutor, ToolError, all_tools};
 
 /// Result type alias for agent operations
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
