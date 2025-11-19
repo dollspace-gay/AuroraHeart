@@ -32,6 +32,9 @@ bytes = "1.9"
 regex = "1.11"
 glob = "0.3"
 
+# Date and time
+chrono = "0.4"
+
 # Logging
 tracing.workspace = true
 

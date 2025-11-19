@@ -208,6 +208,32 @@ pub fn glob_tool() -> Tool {
     }
 }
 
+/// Create the List Directory tool definition
+pub fn list_directory_tool() -> Tool {
+    Tool {
+        name: "list_directory".to_string(),
+        description: "List directory contents with file metadata including size, modified time, and type.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to list (defaults to current directory)"
+                },
+                "show_hidden": {
+                    "type": "boolean",
+                    "description": "Whether to show hidden files (default: false)"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Whether to list subdirectories recursively (default: false)"
+                }
+            },
+            "required": []
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -217,6 +243,7 @@ pub fn all_tools() -> Vec<Tool> {
         bash_tool(),
         grep_tool(),
         glob_tool(),
+        list_directory_tool(),
     ]
 }
 
@@ -273,7 +300,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -282,6 +309,7 @@ mod tests {
         assert!(tool_names.contains(&"bash".to_string()));
         assert!(tool_names.contains(&"grep".to_string()));
         assert!(tool_names.contains(&"glob".to_string()));
+        assert!(tool_names.contains(&"list_directory".to_string()));
     }
 
     #[test]

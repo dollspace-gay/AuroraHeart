@@ -61,6 +61,7 @@ impl ToolExecutor {
             "bash" => self.execute_bash(&tool_use.input).await,
             "grep" => self.execute_grep(&tool_use.input).await,
             "glob" => self.execute_glob(&tool_use.input).await,
+            "list_directory" => self.execute_list_directory(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -363,6 +364,179 @@ impl ToolExecutor {
                 file_list.join("\n")
             ))
         }
+    }
+
+    /// Execute the List Directory tool
+    async fn execute_list_directory(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let dir_path = input["path"]
+            .as_str()
+            .map(|p| {
+                let path = Path::new(p);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.working_directory.join(path)
+                }
+            })
+            .unwrap_or_else(|| self.working_directory.clone());
+
+        let show_hidden = input["show_hidden"].as_bool().unwrap_or(false);
+        let recursive = input["recursive"].as_bool().unwrap_or(false);
+
+        if !dir_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "Directory does not exist: {}",
+                dir_path.display()
+            )));
+        }
+
+        if !dir_path.is_dir() {
+            return Err(ToolError::InvalidInput(format!(
+                "Path is not a directory: {}",
+                dir_path.display()
+            )));
+        }
+
+        let mut entries = Vec::new();
+        self.collect_directory_entries(&dir_path, show_hidden, recursive, &mut entries, 0)
+            .await?;
+
+        if entries.is_empty() {
+            Ok(format!("Directory is empty: {}", dir_path.display()))
+        } else {
+            // Sort entries: directories first, then by name
+            entries.sort_by(|a, b| {
+                match (a.is_dir, b.is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.cmp(&b.name),
+                }
+            });
+
+            let formatted_entries: Vec<String> = entries
+                .iter()
+                .map(|e| e.format())
+                .collect();
+
+            Ok(format!(
+                "Directory: {}\n{} items:\n\n{}",
+                dir_path.display(),
+                entries.len(),
+                formatted_entries.join("\n")
+            ))
+        }
+    }
+
+    /// Recursively collect directory entries
+    fn collect_directory_entries<'a>(
+        &'a self,
+        dir_path: &'a Path,
+        show_hidden: bool,
+        recursive: bool,
+        entries: &'a mut Vec<DirectoryEntry>,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+        Box::pin(async move {
+            let mut read_dir = tokio::fs::read_dir(dir_path).await?;
+
+            while let Some(entry) = read_dir.next_entry().await? {
+                let file_name = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string();
+
+                // Skip hidden files if not requested
+                if !show_hidden && file_name.starts_with('.') {
+                    continue;
+                }
+
+                let path = entry.path();
+                let metadata = entry.metadata().await?;
+
+                let is_dir = metadata.is_dir();
+                let size = if is_dir { None } else { Some(metadata.len()) };
+
+                // Get modified time
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| {
+                        time.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| {
+                                let datetime = chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)?;
+                                Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+                            })
+                    })
+                    .flatten();
+
+                entries.push(DirectoryEntry {
+                    name: file_name.clone(),
+                    path: path.display().to_string(),
+                    is_dir,
+                    size,
+                    modified,
+                    depth,
+                });
+
+                // Recursively process subdirectories
+                if recursive && is_dir {
+                    self.collect_directory_entries(&path, show_hidden, recursive, entries, depth + 1)
+                        .await?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Directory entry information
+struct DirectoryEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<String>,
+    depth: usize,
+}
+
+impl DirectoryEntry {
+    fn format(&self) -> String {
+        let indent = "  ".repeat(self.depth);
+        let type_indicator = if self.is_dir { "📁" } else { "📄" };
+        let size_str = self
+            .size
+            .map(|s| format_size(s))
+            .unwrap_or_else(|| "    -".to_string());
+        let modified_str = self
+            .modified
+            .as_ref()
+            .map(|m| m.as_str())
+            .unwrap_or("unknown");
+
+        format!(
+            "{}{} {} {:>10}  {}  {}",
+            indent, type_indicator, self.name, size_str, modified_str, self.path
+        )
+    }
+}
+
+/// Format file size in human-readable format
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_index])
     }
 }
 
@@ -743,5 +917,182 @@ mod tests {
         let result = executor.execute(&tool_use).await;
         assert_eq!(result.is_error, None);
         assert!(result.content.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_basic() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create test files and directories
+        tokio::fs::write(temp_dir.path().join("file1.txt"), "content1").await.unwrap();
+        tokio::fs::write(temp_dir.path().join("file2.rs"), "content2").await.unwrap();
+        tokio::fs::create_dir(temp_dir.path().join("subdir")).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("3 items"));
+        assert!(result.content.contains("file1.txt"));
+        assert!(result.content.contains("file2.rs"));
+        assert!(result.content.contains("subdir"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_with_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("testdir");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+        tokio::fs::write(subdir.join("nested.txt"), "content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "path": "testdir"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("nested.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_hidden_files() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("visible.txt"), "content").await.unwrap();
+        tokio::fs::write(temp_dir.path().join(".hidden"), "secret").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Test without show_hidden
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "show_hidden": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("visible.txt"));
+        assert!(!result.content.contains(".hidden"));
+
+        // Test with show_hidden
+        let tool_use_show = ToolUse {
+            id: "test_456".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "show_hidden": true
+            }),
+        };
+
+        let result_show = executor.execute(&tool_use_show).await;
+        assert_eq!(result_show.is_error, None);
+        assert!(result_show.content.contains("visible.txt"));
+        assert!(result_show.content.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("root.txt"), "content").await.unwrap();
+
+        let subdir = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+        tokio::fs::write(subdir.join("nested.txt"), "content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Test non-recursive
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "recursive": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("root.txt"));
+        assert!(result.content.contains("subdir"));
+        assert!(!result.content.contains("nested.txt"));
+
+        // Test recursive
+        let tool_use_recursive = ToolUse {
+            id: "test_456".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "recursive": true
+            }),
+        };
+
+        let result_recursive = executor.execute(&tool_use_recursive).await;
+        assert_eq!(result_recursive.is_error, None);
+        assert!(result_recursive.content.contains("root.txt"));
+        assert!(result_recursive.content.contains("subdir"));
+        assert!(result_recursive.content.contains("nested.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_empty() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Directory is empty"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "path": "nonexistent"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_not_a_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(temp_dir.path().join("file.txt"), "content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "path": "file.txt"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("not a directory"));
     }
 }
