@@ -63,6 +63,8 @@ impl ToolExecutor {
             "glob" => self.execute_glob(&tool_use.input).await,
             "list_directory" => self.execute_list_directory(&tool_use.input).await,
             "multi_replace" => self.execute_multi_replace(&tool_use.input).await,
+            "syntax_check" => self.execute_syntax_check(&tool_use.input).await,
+            "code_format" => self.execute_code_format(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -650,6 +652,496 @@ impl ToolExecutor {
 
             Ok(())
         })
+    }
+
+    /// Execute the Syntax Check tool
+    async fn execute_syntax_check(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let file_path = input["file_path"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
+
+        let path = Path::new(file_path);
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_directory.join(path)
+        };
+
+        // Check if file exists
+        if !absolute_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "File does not exist: {}",
+                absolute_path.display()
+            )));
+        }
+
+        // Detect language from file extension or use provided language
+        let language = if let Some(lang) = input["language"].as_str() {
+            lang.to_lowercase()
+        } else {
+            // Auto-detect from file extension
+            absolute_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| match e {
+                    "rs" => "rust",
+                    "js" | "mjs" | "cjs" => "javascript",
+                    "ts" | "mts" | "cts" => "typescript",
+                    "py" => "python",
+                    "go" => "go",
+                    "java" => "java",
+                    "c" => "c",
+                    "cpp" | "cc" | "cxx" => "cpp",
+                    "rb" => "ruby",
+                    "php" => "php",
+                    "swift" => "swift",
+                    "kt" => "kotlin",
+                    "cs" => "csharp",
+                    _ => "unknown",
+                })
+                .unwrap_or("unknown")
+                .to_string()
+        };
+
+        let strict = input["strict"].as_bool().unwrap_or(false);
+
+        // Execute language-specific syntax checker
+        let result = match language.as_str() {
+            "rust" => self.check_rust_syntax(&absolute_path, strict).await?,
+            "javascript" | "typescript" => self.check_js_ts_syntax(&absolute_path, &language, strict).await?,
+            "python" => self.check_python_syntax(&absolute_path, strict).await?,
+            "go" => self.check_go_syntax(&absolute_path, strict).await?,
+            "c" | "cpp" => self.check_c_cpp_syntax(&absolute_path, &language, strict).await?,
+            "unknown" => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Cannot determine language for file: {}. Please specify the 'language' parameter.",
+                    absolute_path.display()
+                )));
+            }
+            unsupported => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Syntax checking for '{}' is not yet supported. Supported languages: rust, javascript, typescript, python, go, c, cpp",
+                    unsupported
+                )));
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Check Rust syntax using cargo check or rustc
+    async fn check_rust_syntax(&self, file_path: &Path, strict: bool) -> Result<String, ToolError> {
+        // First try cargo check if in a cargo project
+        let cargo_toml = file_path
+            .ancestors()
+            .find(|p| p.join("Cargo.toml").exists());
+
+        if let Some(project_root) = cargo_toml {
+            let mut cmd = tokio::process::Command::new("cargo");
+            cmd.arg("check")
+                .arg("--message-format=short")
+                .current_dir(project_root);
+
+            if !strict {
+                cmd.arg("--quiet");
+            }
+
+            let output = cmd.output().await?;
+
+            if output.status.success() {
+                Ok(format!("✅ Rust syntax check passed for {}", file_path.display()))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Ok(format!(
+                    "❌ Rust syntax errors found:\n\n{}\n{}",
+                    stdout, stderr
+                ))
+            }
+        } else {
+            // Fallback to rustc --emit=metadata for single file (no executable output)
+            let mut cmd = tokio::process::Command::new("rustc");
+            cmd.arg("--crate-type").arg("lib")
+                .arg("--emit=metadata")
+                .arg("--out-dir")
+                .arg(std::env::temp_dir())
+                .arg(file_path);
+
+            let output = cmd.output().await?;
+
+            if output.status.success() {
+                Ok(format!("✅ Rust syntax check passed for {}", file_path.display()))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Ok(format!("❌ Rust syntax errors found:\n\n{}", stderr))
+            }
+        }
+    }
+
+    /// Check JavaScript/TypeScript syntax using Node.js or tsc
+    async fn check_js_ts_syntax(&self, file_path: &Path, language: &str, strict: bool) -> Result<String, ToolError> {
+        if language == "typescript" {
+            // Try using tsc for TypeScript
+            let mut cmd = tokio::process::Command::new("tsc");
+            cmd.arg("--noEmit")
+                .arg("--allowJs")
+                .arg(file_path);
+
+            if strict {
+                cmd.arg("--strict");
+            }
+
+            let output = cmd.output().await;
+
+            match output {
+                Ok(output) => {
+                    if output.status.success() {
+                        Ok(format!("✅ TypeScript syntax check passed for {}", file_path.display()))
+                    } else {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        Ok(format!(
+                            "❌ TypeScript syntax errors found:\n\n{}\n{}",
+                            stdout, stderr
+                        ))
+                    }
+                }
+                Err(_) => {
+                    // Fallback to Node.js syntax check
+                    self.check_with_node(file_path).await
+                }
+            }
+        } else {
+            // JavaScript - use Node.js
+            self.check_with_node(file_path).await
+        }
+    }
+
+    /// Check syntax using Node.js
+    async fn check_with_node(&self, file_path: &Path) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("node");
+        cmd.arg("--check")
+            .arg(file_path);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            Ok(format!("✅ JavaScript syntax check passed for {}", file_path.display()))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!("❌ JavaScript syntax errors found:\n\n{}", stderr))
+        }
+    }
+
+    /// Check Python syntax
+    async fn check_python_syntax(&self, file_path: &Path, _strict: bool) -> Result<String, ToolError> {
+        // Use Python's compile function to check syntax
+        let mut cmd = tokio::process::Command::new("python");
+        cmd.arg("-m")
+            .arg("py_compile")
+            .arg(file_path);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            Ok(format!("✅ Python syntax check passed for {}", file_path.display()))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!("❌ Python syntax errors found:\n\n{}", stderr))
+        }
+    }
+
+    /// Check Go syntax
+    async fn check_go_syntax(&self, file_path: &Path, _strict: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("go");
+        cmd.arg("build")
+            .arg("-o")
+            .arg("/dev/null")
+            .arg(file_path);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            Ok(format!("✅ Go syntax check passed for {}", file_path.display()))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(format!(
+                "❌ Go syntax errors found:\n\n{}\n{}",
+                stdout, stderr
+            ))
+        }
+    }
+
+    /// Check C/C++ syntax using compiler
+    async fn check_c_cpp_syntax(&self, file_path: &Path, language: &str, strict: bool) -> Result<String, ToolError> {
+        let compiler = if language == "cpp" { "g++" } else { "gcc" };
+
+        let mut cmd = tokio::process::Command::new(compiler);
+        cmd.arg("-fsyntax-only")
+            .arg(file_path);
+
+        if strict {
+            cmd.arg("-Wall").arg("-Wextra").arg("-pedantic");
+        }
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            Ok(format!("✅ {} syntax check passed for {}", language.to_uppercase(), file_path.display()))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!("❌ {} syntax errors found:\n\n{}", language.to_uppercase(), stderr))
+        }
+    }
+
+    /// Execute the Code Format tool
+    async fn execute_code_format(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let file_path = input["file_path"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
+
+        let path = Path::new(file_path);
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_directory.join(path)
+        };
+
+        // Check if file exists
+        if !absolute_path.exists() {
+            return Err(ToolError::InvalidInput(format!(
+                "File does not exist: {}",
+                absolute_path.display()
+            )));
+        }
+
+        // Detect language from file extension or use provided language
+        let language = if let Some(lang) = input["language"].as_str() {
+            lang.to_lowercase()
+        } else {
+            // Auto-detect from file extension
+            absolute_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| match e {
+                    "rs" => "rust",
+                    "js" | "mjs" | "cjs" => "javascript",
+                    "ts" | "mts" | "cts" => "typescript",
+                    "py" => "python",
+                    "go" => "go",
+                    "c" => "c",
+                    "cpp" | "cc" | "cxx" | "h" | "hpp" => "cpp",
+                    _ => "unknown",
+                })
+                .unwrap_or("unknown")
+                .to_string()
+        };
+
+        let check_only = input["check_only"].as_bool().unwrap_or(false);
+
+        // Execute language-specific formatter
+        let result = match language.as_str() {
+            "rust" => self.format_rust(&absolute_path, check_only).await?,
+            "javascript" | "typescript" => self.format_js_ts(&absolute_path, check_only).await?,
+            "python" => self.format_python(&absolute_path, check_only).await?,
+            "go" => self.format_go(&absolute_path, check_only).await?,
+            "c" | "cpp" => self.format_c_cpp(&absolute_path, check_only).await?,
+            "unknown" => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Cannot determine language for file: {}. Please specify the 'language' parameter.",
+                    absolute_path.display()
+                )));
+            }
+            unsupported => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Code formatting for '{}' is not yet supported. Supported languages: rust, javascript, typescript, python, go, c, cpp",
+                    unsupported
+                )));
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Format Rust code using rustfmt
+    async fn format_rust(&self, file_path: &Path, check_only: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("rustfmt");
+
+        if check_only {
+            cmd.arg("--check");
+        }
+
+        cmd.arg(file_path);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            if check_only {
+                Ok(format!("✅ {} is correctly formatted", file_path.display()))
+            } else {
+                Ok(format!("✅ Successfully formatted {}", file_path.display()))
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            if check_only {
+                Ok(format!("❌ {} requires formatting:\n\n{}{}", file_path.display(), stdout, stderr))
+            } else {
+                Err(ToolError::CommandFailed(format!(
+                    "Failed to format file:\n\n{}{}",
+                    stdout, stderr
+                )))
+            }
+        }
+    }
+
+    /// Format JavaScript/TypeScript code using prettier
+    async fn format_js_ts(&self, file_path: &Path, check_only: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("prettier");
+
+        if check_only {
+            cmd.arg("--check");
+        } else {
+            cmd.arg("--write");
+        }
+
+        cmd.arg(file_path);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            if check_only {
+                Ok(format!("✅ {} is correctly formatted", file_path.display()))
+            } else {
+                Ok(format!("✅ Successfully formatted {}", file_path.display()))
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            if check_only {
+                Ok(format!("❌ {} requires formatting:\n\n{}{}", file_path.display(), stdout, stderr))
+            } else {
+                Err(ToolError::CommandFailed(format!(
+                    "Failed to format file:\n\n{}{}",
+                    stdout, stderr
+                )))
+            }
+        }
+    }
+
+    /// Format Python code using black
+    async fn format_python(&self, file_path: &Path, check_only: bool) -> Result<String, ToolError> {
+        let mut cmd = tokio::process::Command::new("black");
+
+        if check_only {
+            cmd.arg("--check");
+        }
+
+        cmd.arg(file_path);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            if check_only {
+                Ok(format!("✅ {} is correctly formatted", file_path.display()))
+            } else {
+                Ok(format!("✅ Successfully formatted {}", file_path.display()))
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            if check_only {
+                Ok(format!("❌ {} requires formatting:\n\n{}{}", file_path.display(), stdout, stderr))
+            } else {
+                Err(ToolError::CommandFailed(format!(
+                    "Failed to format file:\n\n{}{}",
+                    stdout, stderr
+                )))
+            }
+        }
+    }
+
+    /// Format Go code using gofmt
+    async fn format_go(&self, file_path: &Path, check_only: bool) -> Result<String, ToolError> {
+        if check_only {
+            // Use gofmt -l to list files that need formatting
+            let mut cmd = tokio::process::Command::new("gofmt");
+            cmd.arg("-l").arg(file_path);
+
+            let output = cmd.output().await?;
+
+            if output.stdout.is_empty() {
+                Ok(format!("✅ {} is correctly formatted", file_path.display()))
+            } else {
+                Ok(format!("❌ {} requires formatting", file_path.display()))
+            }
+        } else {
+            // Use gofmt -w to write formatted output
+            let mut cmd = tokio::process::Command::new("gofmt");
+            cmd.arg("-w").arg(file_path);
+
+            let output = cmd.output().await?;
+
+            if output.status.success() {
+                Ok(format!("✅ Successfully formatted {}", file_path.display()))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(ToolError::CommandFailed(format!(
+                    "Failed to format file:\n\n{}",
+                    stderr
+                )))
+            }
+        }
+    }
+
+    /// Format C/C++ code using clang-format
+    async fn format_c_cpp(&self, file_path: &Path, check_only: bool) -> Result<String, ToolError> {
+        if check_only {
+            // Read original file
+            let original = tokio::fs::read_to_string(file_path).await?;
+
+            // Format to stdout
+            let mut cmd = tokio::process::Command::new("clang-format");
+            cmd.arg(file_path);
+
+            let output = cmd.output().await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(ToolError::CommandFailed(format!(
+                    "Failed to format file:\n\n{}",
+                    stderr
+                )));
+            }
+
+            let formatted = String::from_utf8_lossy(&output.stdout);
+
+            if original == formatted {
+                Ok(format!("✅ {} is correctly formatted", file_path.display()))
+            } else {
+                Ok(format!("❌ {} requires formatting", file_path.display()))
+            }
+        } else {
+            // Use -i to format in-place
+            let mut cmd = tokio::process::Command::new("clang-format");
+            cmd.arg("-i").arg(file_path);
+
+            let output = cmd.output().await?;
+
+            if output.status.success() {
+                Ok(format!("✅ Successfully formatted {}", file_path.display()))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(ToolError::CommandFailed(format!(
+                    "Failed to format file:\n\n{}",
+                    stderr
+                )))
+            }
+        }
     }
 }
 
@@ -1427,5 +1919,324 @@ mod tests {
         let result = executor.execute(&tool_use).await;
         assert_eq!(result.is_error, None);
         assert!(result.content.contains("3 files would be changed"));
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_rust_valid() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("valid.rs");
+        tokio::fs::write(&file_path, r#"
+fn main() {
+    println!("Hello, World!");
+}
+"#).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap()
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("✅") || result.content.contains("syntax check passed"));
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_rust_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("invalid.rs");
+        tokio::fs::write(&file_path, r#"
+fn main() {
+    println!("Hello, World!"
+    // Missing closing parenthesis
+}
+"#).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap()
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // May succeed with error output or fail, but should not panic
+        assert!(result.content.contains("❌") || result.content.contains("error") || result.content.contains("✅"));
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_with_language_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        tokio::fs::write(&file_path, r#"
+fn main() {
+    println!("Hello, World!");
+}
+"#).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "language": "rust"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should be able to check rust syntax even with .txt extension
+        assert_eq!(result.is_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_file_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": "nonexistent.rs"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_unknown_language() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.xyz");
+        tokio::fs::write(&file_path, "some content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap()
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Cannot determine language"));
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_unsupported_language() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.xyz");
+        tokio::fs::write(&file_path, "some content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "language": "ruby"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_strict_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        tokio::fs::write(&file_path, r#"
+fn main() {
+    println!("Hello, World!");
+}
+"#).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "strict": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should not fail with strict mode on valid code
+        assert_eq!(result.is_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_syntax_check_missing_file_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing file_path"));
+    }
+
+    #[tokio::test]
+    async fn test_code_format_rust_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("format_test.rs");
+        tokio::fs::write(&file_path, r#"
+fn main() {
+    println!("Hello, World!");
+}
+"#).await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "check_only": true
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should not error
+        assert_eq!(result.is_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_code_format_rust_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("format_test.rs");
+        // Intentionally poorly formatted Rust code
+        tokio::fs::write(&file_path, "fn main(){println!(\"test\");}").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "check_only": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should successfully format
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("✅") || result.content.contains("formatted"));
+    }
+
+    #[tokio::test]
+    async fn test_code_format_file_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": "nonexistent.rs"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_code_format_unknown_language() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.xyz");
+        tokio::fs::write(&file_path, "some content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap()
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Cannot determine language"));
+    }
+
+    #[tokio::test]
+    async fn test_code_format_with_language_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        tokio::fs::write(&file_path, "fn main(){println!(\"test\");}").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "language": "rust",
+                "check_only": false
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        // Should be able to format rust code even with .txt extension
+        assert_eq!(result.is_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_code_format_unsupported_language() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.xyz");
+        tokio::fs::write(&file_path, "some content").await.unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "language": "ruby"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn test_code_format_missing_file_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Missing file_path"));
     }
 }

@@ -276,6 +276,58 @@ pub fn multi_replace_tool() -> Tool {
     }
 }
 
+/// Create the Syntax Check tool definition
+pub fn syntax_check_tool() -> Tool {
+    Tool {
+        name: "syntax_check".to_string(),
+        description: "Check syntax validity of code files using language-specific validators. Supports Rust, JavaScript, TypeScript, Python, and more.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to check"
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional language override (rust, javascript, typescript, python, etc.). If not specified, detected from file extension."
+                },
+                "strict": {
+                    "type": "boolean",
+                    "description": "Enable strict checking mode with more detailed diagnostics (default: false)"
+                }
+            },
+            "required": ["file_path"]
+        }),
+    }
+}
+
+/// Create the Code Format tool definition
+pub fn code_format_tool() -> Tool {
+    Tool {
+        name: "code_format".to_string(),
+        description: "Format code files according to language-specific style guidelines. Supports Rust (rustfmt), JavaScript/TypeScript (prettier), Python (black), Go (gofmt), and C/C++ (clang-format).".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to format"
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional language override (rust, javascript, typescript, python, go, c, cpp). If not specified, detected from file extension."
+                },
+                "check_only": {
+                    "type": "boolean",
+                    "description": "If true, only check if file is formatted correctly without modifying (default: false)"
+                }
+            },
+            "required": ["file_path"]
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -287,6 +339,8 @@ pub fn all_tools() -> Vec<Tool> {
         glob_tool(),
         list_directory_tool(),
         multi_replace_tool(),
+        syntax_check_tool(),
+        code_format_tool(),
     ]
 }
 
@@ -343,7 +397,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -354,6 +408,8 @@ mod tests {
         assert!(tool_names.contains(&"glob".to_string()));
         assert!(tool_names.contains(&"list_directory".to_string()));
         assert!(tool_names.contains(&"multi_replace".to_string()));
+        assert!(tool_names.contains(&"syntax_check".to_string()));
+        assert!(tool_names.contains(&"code_format".to_string()));
     }
 
     #[test]

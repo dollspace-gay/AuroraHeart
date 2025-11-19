@@ -1160,7 +1160,7 @@ mod tests {
 
         // Verify request has tools
         assert!(request.tools.is_some());
-        assert_eq!(request.tools.as_ref().unwrap().len(), 8);
+        assert_eq!(request.tools.as_ref().unwrap().len(), 10);
 
         let result = client.send_message(request).await;
         assert!(result.is_ok());
@@ -1252,7 +1252,7 @@ mod tests {
         .with_tools(all_tools());
 
         assert!(request.tools.is_some());
-        assert_eq!(request.tools.as_ref().unwrap().len(), 8);
+        assert_eq!(request.tools.as_ref().unwrap().len(), 10);
 
         // Verify it serializes correctly
         let json = serde_json::to_string(&request).unwrap();
@@ -1265,5 +1265,7 @@ mod tests {
         assert!(json.contains("\"glob\""));
         assert!(json.contains("\"list_directory\""));
         assert!(json.contains("\"multi_replace\""));
+        assert!(json.contains("\"syntax_check\""));
+        assert!(json.contains("\"code_format\""));
     }
 }
