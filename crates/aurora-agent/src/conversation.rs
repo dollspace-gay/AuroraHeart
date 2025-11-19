@@ -12,29 +12,129 @@ pub enum Role {
     Assistant,
 }
 
+/// Content of a message - either simple text or structured content blocks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// Simple text content
+    Text(String),
+    /// Structured content blocks (for tool use/results)
+    Blocks(Vec<crate::client::ContentBlock>),
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        MessageContent::Text(s)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        MessageContent::Text(s.to_string())
+    }
+}
+
+impl From<Vec<crate::client::ContentBlock>> for MessageContent {
+    fn from(blocks: Vec<crate::client::ContentBlock>) -> Self {
+        MessageContent::Blocks(blocks)
+    }
+}
+
+impl PartialEq<String> for MessageContent {
+    fn eq(&self, other: &String) -> bool {
+        match self {
+            MessageContent::Text(text) => text == other,
+            MessageContent::Blocks(_) => false,
+        }
+    }
+}
+
+impl PartialEq<&str> for MessageContent {
+    fn eq(&self, other: &&str) -> bool {
+        match self {
+            MessageContent::Text(text) => text == other,
+            MessageContent::Blocks(_) => false,
+        }
+    }
+}
+
+impl MessageContent {
+    /// Get text content if this is a text message, None otherwise
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            MessageContent::Text(text) => Some(text),
+            MessageContent::Blocks(_) => None,
+        }
+    }
+}
+
 /// A message in a conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     /// Role of the sender
     pub role: Role,
     /// Content of the message
-    pub content: String,
+    pub content: MessageContent,
 }
 
 impl Message {
-    /// Create a new user message
+    /// Create a new user message with text content
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
         }
     }
 
-    /// Create a new assistant message
+    /// Create a new assistant message with text content
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
+        }
+    }
+
+    /// Create a new user message with content blocks
+    pub fn user_with_blocks(blocks: Vec<crate::client::ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content: MessageContent::Blocks(blocks),
+        }
+    }
+
+    /// Create a new assistant message with content blocks
+    pub fn assistant_with_blocks(blocks: Vec<crate::client::ContentBlock>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(blocks),
+        }
+    }
+
+    /// Get the text content if this is a text message
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.content {
+            MessageContent::Text(text) => Some(text),
+            MessageContent::Blocks(_) => None,
+        }
+    }
+
+    /// Get the content blocks if this is a blocks message
+    pub fn as_blocks(&self) -> Option<&[crate::client::ContentBlock]> {
+        match &self.content {
+            MessageContent::Text(_) => None,
+            MessageContent::Blocks(blocks) => Some(blocks),
+        }
+    }
+
+    /// Get the character count of this message
+    pub fn char_count(&self) -> usize {
+        match &self.content {
+            MessageContent::Text(text) => text.len(),
+            MessageContent::Blocks(blocks) => blocks.iter().map(|b| match b {
+                crate::client::ContentBlock::Text { text } => text.len(),
+                crate::client::ContentBlock::ToolUse { .. } => 50,  // Rough estimate
+                crate::client::ContentBlock::ToolResult { content, .. } => content.len(),
+            }).sum(),
         }
     }
 }
@@ -90,7 +190,7 @@ impl Conversation {
     /// Get the total number of characters in the conversation
     pub fn total_chars(&self) -> usize {
         self.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0)
-            + self.messages.iter().map(|m| m.content.len()).sum::<usize>()
+            + self.messages.iter().map(|m| m.char_count()).sum::<usize>()
     }
 
     /// Get the number of messages in the conversation
@@ -108,7 +208,7 @@ impl Conversation {
     /// Number of messages removed
     pub fn truncate_to_limit(&mut self, max_chars: usize) -> usize {
         let system_chars = self.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-        let mut current_chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        let mut current_chars: usize = self.messages.iter().map(|m| m.char_count()).sum();
 
         if current_chars + system_chars <= max_chars {
             return 0; // No truncation needed
@@ -120,7 +220,7 @@ impl Conversation {
         // Remove messages from the beginning until we're under the limit
         while current_chars > target_chars && !self.messages.is_empty() {
             if let Some(msg) = self.messages.first() {
-                current_chars = current_chars.saturating_sub(msg.content.len());
+                current_chars = current_chars.saturating_sub(msg.char_count());
             }
             self.messages.remove(0);
             removed_count += 1;

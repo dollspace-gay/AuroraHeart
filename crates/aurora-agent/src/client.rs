@@ -3,11 +3,39 @@
 //! This module provides a client for interacting with Anthropic's Claude API,
 //! including support for streaming responses and tool use.
 
-use crate::conversation::{Conversation, Message, Role};
+use crate::conversation::{Conversation, Message, MessageContent, Role};
 use crate::tools::{Tool, ToolResult, ToolUse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
+
+/// Events that occur during an agentic loop execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AgenticEvent {
+    /// Claude called a tool
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        id: String,
+        name: String,
+        input: JsonValue,
+    },
+
+    /// Tool execution result
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+
+    /// Claude sent a text response
+    #[serde(rename = "text_response")]
+    TextResponse {
+        text: String,
+    },
+}
 
 /// Errors that can occur during API client operations
 #[derive(Error, Debug)]
@@ -129,13 +157,47 @@ pub struct MessageRequest {
     pub top_k: Option<usize>,
 }
 
+/// Content for API messages - can be either string or content blocks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ApiMessageContent {
+    /// Simple text content
+    Text(String),
+    /// Structured content blocks
+    Blocks(Vec<ContentBlock>),
+}
+
+impl PartialEq<String> for ApiMessageContent {
+    fn eq(&self, other: &String) -> bool {
+        match self {
+            ApiMessageContent::Text(text) => text == other,
+            ApiMessageContent::Blocks(_) => false,
+        }
+    }
+}
+
+impl PartialEq<&str> for ApiMessageContent {
+    fn eq(&self, other: &&str) -> bool {
+        match self {
+            ApiMessageContent::Text(text) => text == other,
+            ApiMessageContent::Blocks(_) => false,
+        }
+    }
+}
+
+impl From<String> for ApiMessageContent {
+    fn from(s: String) -> Self {
+        ApiMessageContent::Text(s)
+    }
+}
+
 /// A message in the conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiMessage {
     /// Role of the message sender
     pub role: String,
     /// Content of the message
-    pub content: String,
+    pub content: ApiMessageContent,
 }
 
 /// Response from Claude
@@ -363,7 +425,10 @@ impl ApiMessage {
                 Role::User => "user".to_string(),
                 Role::Assistant => "assistant".to_string(),
             },
-            content: message.content.clone(),
+            content: match &message.content {
+                MessageContent::Text(text) => ApiMessageContent::Text(text.clone()),
+                MessageContent::Blocks(blocks) => ApiMessageContent::Blocks(blocks.clone()),
+            },
         }
     }
 }
@@ -518,6 +583,109 @@ impl AnthropicClient {
         self.send_message_with_retry(request, max_retries).await
     }
 
+    /// Run an agentic loop with tool execution
+    ///
+    /// This method sends the conversation to Claude, executes any requested tools,
+    /// and repeats until Claude responds with text (no more tool calls).
+    /// Returns a vector of events that occurred during the loop for UI display.
+    ///
+    /// # Arguments
+    ///
+    /// * `conversation` - Mutable conversation that will be updated with tool results
+    /// * `executor` - Tool executor for running tools
+    /// * `max_iterations` - Maximum number of agentic loop iterations (default 10)
+    ///
+    /// # Returns
+    ///
+    /// A vector of `AgenticEvent` instances representing what happened during execution
+    pub async fn run_agentic_loop(
+        &self,
+        conversation: &mut Conversation,
+        executor: &crate::tools::ToolExecutor,
+        max_iterations: Option<usize>,
+    ) -> Result<Vec<AgenticEvent>, ClientError> {
+        let max_iterations = max_iterations.unwrap_or(10);
+        let mut events = Vec::new();
+
+        for iteration in 0..max_iterations {
+            tracing::debug!("Agentic loop iteration {}", iteration);
+
+            // Create request with tools
+            let request = MessageRequest::from_conversation(conversation, Self::default_model())
+                .with_tools(crate::tools::all_tools());
+
+            // Send request
+            let response = self.send_message(request).await?;
+
+            // Check if response contains tool use
+            let mut has_tool_use = false;
+            let mut tool_results = Vec::new();
+
+            for content_block in &response.content {
+                match content_block {
+                    ContentBlock::Text { text } => {
+                        // Add text response to events
+                        events.push(AgenticEvent::TextResponse {
+                            text: text.clone(),
+                        });
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        has_tool_use = true;
+
+                        // Record tool call event
+                        events.push(AgenticEvent::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+
+                        // Execute the tool
+                        let tool_use = crate::tools::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        };
+
+                        let result = executor.execute(&tool_use).await;
+
+                        // Record tool result event
+                        events.push(AgenticEvent::ToolResult {
+                            tool_use_id: result.tool_use_id.clone(),
+                            content: result.content.clone(),
+                            is_error: result.is_error,
+                        });
+
+                        tool_results.push(result);
+                    }
+                    ContentBlock::ToolResult { .. } => {
+                        // This shouldn't happen in assistant responses
+                        tracing::warn!("Unexpected tool result in assistant response");
+                    }
+                }
+            }
+
+            // If no tool use, we're done
+            if !has_tool_use {
+                break;
+            }
+
+            // Add assistant message with tool use to conversation
+            let assistant_message = Message::assistant_with_blocks(response.content.clone());
+            conversation.messages.push(assistant_message);
+
+            // Add tool results to conversation as user message
+            let tool_result_blocks: Vec<ContentBlock> = tool_results
+                .iter()
+                .map(|result| ContentBlock::from_tool_result(result))
+                .collect();
+
+            let user_message = Message::user_with_blocks(tool_result_blocks);
+            conversation.messages.push(user_message);
+        }
+
+        Ok(events)
+    }
+
     /// Get the model name
     pub fn default_model() -> &'static str {
         "claude-sonnet-4-20250514"
@@ -593,7 +761,7 @@ mod tests {
             max_tokens: 1024,
             messages: vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello!".to_string(),
+                content: "Hello!".to_string().into(),
             }],
             system: Some("You are a helpful assistant.".to_string()),
             tools: None,
@@ -612,7 +780,7 @@ mod tests {
     fn test_message_request_builder() {
         let messages = vec![ApiMessage {
             role: "user".to_string(),
-            content: "Test".to_string(),
+            content: "Test".to_string().into(),
         }];
 
         let request = MessageRequest::new("claude-sonnet-4", messages)
@@ -672,7 +840,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -706,7 +874,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -738,7 +906,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -770,7 +938,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -850,7 +1018,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -887,7 +1055,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -922,7 +1090,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -958,7 +1126,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -987,7 +1155,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         );
 
@@ -1153,7 +1321,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Read the file".to_string(),
+                content: "Read the file".to_string().into(),
             }],
         )
         .with_tools(all_tools());
@@ -1246,7 +1414,7 @@ mod tests {
             "claude-sonnet-4",
             vec![ApiMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: "Hello".to_string().into(),
             }],
         )
         .with_tools(all_tools());

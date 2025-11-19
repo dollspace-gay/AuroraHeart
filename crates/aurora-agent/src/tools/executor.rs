@@ -263,7 +263,7 @@ impl ToolExecutor {
         results: &'a mut Vec<String>,
         match_count: &'a mut usize,
         max_results: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + 'a>> {
         Box::pin(async move {
         if *match_count >= max_results {
             return Ok(());
@@ -446,7 +446,7 @@ impl ToolExecutor {
         recursive: bool,
         entries: &'a mut Vec<DirectoryEntry>,
         depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let mut read_dir = tokio::fs::read_dir(dir_path).await?;
 
@@ -621,7 +621,7 @@ impl ToolExecutor {
         file_pattern: Option<&'a str>,
         files: &'a mut Vec<std::path::PathBuf>,
         max_files: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + 'a>> {
         Box::pin(async move {
             if files.len() >= max_files {
                 return Ok(());
@@ -1600,7 +1600,7 @@ impl ToolExecutor {
         destination: &'a Path,
         files_copied: &'a mut usize,
         dirs_created: &'a mut usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + 'a>> {
         Box::pin(async move {
             // Create destination directory
             if !destination.exists() {
@@ -1697,7 +1697,7 @@ impl ToolExecutor {
         path: &'a Path,
         files: &'a mut usize,
         dirs: &'a mut usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolError>> + Send + 'a>> {
         Box::pin(async move {
             if path.is_file() {
                 *files += 1;
@@ -5629,5 +5629,431 @@ version = "0.1.0"
 
         assert_eq!(result.is_error, None);
         assert!(result.content.contains("sequential"));
+    }
+
+    // Integration Tests - Multi-Tool Workflows
+
+    #[tokio::test]
+    async fn test_integration_write_read_edit_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let file_path = temp_dir.path().join("test.txt");
+
+        // Step 1: Write a file
+        let write_tool = ToolUse {
+            id: "write_1".to_string(),
+            name: "write".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "content": "Hello World\nLine 2\nLine 3"
+            }),
+        };
+
+        let write_result = executor.execute(&write_tool).await;
+        assert_eq!(write_result.is_error, None);
+        assert!(file_path.exists());
+
+        // Step 2: Read the file
+        let read_tool = ToolUse {
+            id: "read_1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap()
+            }),
+        };
+
+        let read_result = executor.execute(&read_tool).await;
+        assert_eq!(read_result.is_error, None);
+        assert!(read_result.content.contains("Hello World"));
+
+        // Step 3: Edit the file
+        let edit_tool = ToolUse {
+            id: "edit_1".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "file_path": file_path.to_str().unwrap(),
+                "old_string": "Hello World",
+                "new_string": "Goodbye World"
+            }),
+        };
+
+        let edit_result = executor.execute(&edit_tool).await;
+        assert_eq!(edit_result.is_error, None);
+
+        // Step 4: Verify the edit
+        let verify_result = executor.execute(&read_tool).await;
+        assert!(verify_result.content.contains("Goodbye World"));
+        assert!(!verify_result.content.contains("Hello World"));
+    }
+
+    #[tokio::test]
+    async fn test_integration_grep_and_replace_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Create test files
+        tokio::fs::write(temp_dir.path().join("file1.txt"), "foo bar baz").await.unwrap();
+        tokio::fs::write(temp_dir.path().join("file2.txt"), "foo qux foo").await.unwrap();
+        tokio::fs::write(temp_dir.path().join("file3.md"), "foo test").await.unwrap();
+
+        // Step 1: Search for pattern
+        let grep_tool = ToolUse {
+            id: "grep_1".to_string(),
+            name: "grep".to_string(),
+            input: serde_json::json!({
+                "pattern": "foo",
+                "path": temp_dir.path().to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }),
+        };
+
+        let grep_result = executor.execute(&grep_tool).await;
+        assert_eq!(grep_result.is_error, None);
+        assert!(grep_result.content.contains("file1.txt"));
+        assert!(grep_result.content.contains("file2.txt"));
+
+        // Step 2: Replace in specific file pattern
+        let replace_tool = ToolUse {
+            id: "replace_1".to_string(),
+            name: "multi_replace".to_string(),
+            input: serde_json::json!({
+                "pattern": "foo",
+                "replacement": "bar",
+                "file_pattern": "*.txt",
+                "base_path": temp_dir.path().to_str().unwrap(),
+                "dry_run": false
+            }),
+        };
+
+        let replace_result = executor.execute(&replace_tool).await;
+        assert_eq!(replace_result.is_error, None);
+        assert!(replace_result.content.contains("2 files"));
+
+        // Step 3: Verify replacements
+        let content1 = tokio::fs::read_to_string(temp_dir.path().join("file1.txt")).await.unwrap();
+        let content2 = tokio::fs::read_to_string(temp_dir.path().join("file2.txt")).await.unwrap();
+        let content3 = tokio::fs::read_to_string(temp_dir.path().join("file3.md")).await.unwrap();
+
+        assert_eq!(content1, "bar bar baz");
+        assert_eq!(content2, "bar qux bar");
+        assert_eq!(content3, "foo test"); // Should not be changed
+    }
+
+    #[tokio::test]
+    async fn test_integration_code_quality_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Create a Rust project structure
+        tokio::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\""
+        ).await.unwrap();
+
+        let src_dir = temp_dir.path().join("src");
+        tokio::fs::create_dir(&src_dir).await.unwrap();
+        tokio::fs::write(
+            src_dir.join("main.rs"),
+            "fn main() {\n    println!(\"Hello\");\n}"
+        ).await.unwrap();
+
+        // Step 1: Syntax check
+        let syntax_tool = ToolUse {
+            id: "syntax_1".to_string(),
+            name: "syntax_check".to_string(),
+            input: serde_json::json!({
+                "file_path": src_dir.join("main.rs").to_str().unwrap()
+            }),
+        };
+
+        let syntax_result = executor.execute(&syntax_tool).await;
+        assert_eq!(syntax_result.is_error, None);
+
+        // Step 2: Code format check
+        let format_tool = ToolUse {
+            id: "format_1".to_string(),
+            name: "code_format".to_string(),
+            input: serde_json::json!({
+                "file_path": src_dir.join("main.rs").to_str().unwrap(),
+                "action": "check"
+            }),
+        };
+
+        let _format_result = executor.execute(&format_tool).await;
+        // Format check might pass or fail depending on rustfmt availability
+
+        // Step 3: Lint (will attempt cargo clippy)
+        let lint_tool = ToolUse {
+            id: "lint_1".to_string(),
+            name: "lint".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let _lint_result = executor.execute(&lint_tool).await;
+        // Lint might fail if clippy isn't available, but shouldn't crash
+    }
+
+    #[tokio::test]
+    async fn test_integration_file_operations_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Step 1: Create source file
+        let source = temp_dir.path().join("source.txt");
+        tokio::fs::write(&source, "test content").await.unwrap();
+
+        // Step 2: Copy file
+        let copy_tool = ToolUse {
+            id: "copy_1".to_string(),
+            name: "copy".to_string(),
+            input: serde_json::json!({
+                "source": "source.txt",
+                "destination": "backup.txt"
+            }),
+        };
+
+        let copy_result = executor.execute(&copy_tool).await;
+        assert_eq!(copy_result.is_error, None);
+        assert!(temp_dir.path().join("backup.txt").exists());
+
+        // Step 3: Edit original
+        let edit_tool = ToolUse {
+            id: "edit_1".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "file_path": source.to_str().unwrap(),
+                "old_string": "test",
+                "new_string": "modified"
+            }),
+        };
+
+        let edit_result = executor.execute(&edit_tool).await;
+        assert_eq!(edit_result.is_error, None);
+
+        // Step 4: Verify both files
+        let original_content = tokio::fs::read_to_string(&source).await.unwrap();
+        let backup_content = tokio::fs::read_to_string(temp_dir.path().join("backup.txt")).await.unwrap();
+
+        assert_eq!(original_content, "modified content");
+        assert_eq!(backup_content, "test content");
+
+        // Step 5: Move file
+        let move_tool = ToolUse {
+            id: "move_1".to_string(),
+            name: "move".to_string(),
+            input: serde_json::json!({
+                "source": "backup.txt",
+                "destination": "archive.txt"
+            }),
+        };
+
+        let move_result = executor.execute(&move_tool).await;
+        assert_eq!(move_result.is_error, None);
+        assert!(!temp_dir.path().join("backup.txt").exists());
+        assert!(temp_dir.path().join("archive.txt").exists());
+
+        // Step 6: Delete file
+        let delete_tool = ToolUse {
+            id: "delete_1".to_string(),
+            name: "delete".to_string(),
+            input: serde_json::json!({
+                "path": "archive.txt"
+            }),
+        };
+
+        let delete_result = executor.execute(&delete_tool).await;
+        assert_eq!(delete_result.is_error, None);
+        assert!(!temp_dir.path().join("archive.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_integration_task_orchestration_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Use Task tool to orchestrate multiple operations
+        let task_tool = ToolUse {
+            id: "task_1".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Setup project structure",
+                "execution_mode": "sequential",
+                "steps": [
+                    {
+                        "name": "Create src directory",
+                        "command": if cfg!(target_os = "windows") { "mkdir src" } else { "mkdir -p src" }
+                    },
+                    {
+                        "name": "Create test directory",
+                        "command": if cfg!(target_os = "windows") { "mkdir tests" } else { "mkdir -p tests" }
+                    },
+                    {
+                        "name": "Create README",
+                        "command": "echo '# Project' > README.md"
+                    },
+                    {
+                        "name": "List structure",
+                        "command": if cfg!(target_os = "windows") { "dir /b" } else { "ls -la" }
+                    }
+                ]
+            }),
+        };
+
+        let task_result = executor.execute(&task_tool).await;
+        assert_eq!(task_result.is_error, None);
+        assert!(task_result.content.contains("4 succeeded"));
+
+        // Verify the structure was created
+        assert!(temp_dir.path().join("src").exists());
+        assert!(temp_dir.path().join("tests").exists());
+        assert!(temp_dir.path().join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_integration_search_and_analyze_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Create a project structure
+        let src_dir = temp_dir.path().join("src");
+        tokio::fs::create_dir(&src_dir).await.unwrap();
+
+        tokio::fs::write(
+            src_dir.join("main.rs"),
+            "fn main() {\n    println!(\"Hello\");\n}\n\nfn helper() {}"
+        ).await.unwrap();
+
+        tokio::fs::write(
+            src_dir.join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}"
+        ).await.unwrap();
+
+        // Step 1: Find all Rust files
+        let glob_tool = ToolUse {
+            id: "glob_1".to_string(),
+            name: "glob".to_string(),
+            input: serde_json::json!({
+                "pattern": "**/*.rs",
+                "path": temp_dir.path().to_str().unwrap()
+            }),
+        };
+
+        let glob_result = executor.execute(&glob_tool).await;
+        assert_eq!(glob_result.is_error, None);
+        assert!(glob_result.content.contains("main.rs"));
+        assert!(glob_result.content.contains("lib.rs"));
+
+        // Step 2: Search for function definitions
+        let grep_tool = ToolUse {
+            id: "grep_1".to_string(),
+            name: "grep".to_string(),
+            input: serde_json::json!({
+                "pattern": "fn \\w+",
+                "path": src_dir.to_str().unwrap(),
+                "output_mode": "content",
+                "-n": true
+            }),
+        };
+
+        let grep_result = executor.execute(&grep_tool).await;
+        assert_eq!(grep_result.is_error, None);
+        assert!(grep_result.content.contains("fn main"));
+        assert!(grep_result.content.contains("fn helper"));
+        assert!(grep_result.content.contains("fn add"));
+
+        // Step 3: List directory contents
+        let list_tool = ToolUse {
+            id: "list_1".to_string(),
+            name: "list_directory".to_string(),
+            input: serde_json::json!({
+                "path": src_dir.to_str().unwrap()
+            }),
+        };
+
+        let list_result = executor.execute(&list_tool).await;
+        assert_eq!(list_result.is_error, None);
+        assert!(list_result.content.contains("main.rs"));
+        assert!(list_result.content.contains("lib.rs"));
+    }
+
+    // Error Handling Integration Tests
+
+    #[tokio::test]
+    async fn test_integration_error_recovery_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Try to read non-existent file
+        let read_tool = ToolUse {
+            id: "read_1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({
+                "file_path": temp_dir.path().join("nonexistent.txt").to_str().unwrap()
+            }),
+        };
+
+        let read_result = executor.execute(&read_tool).await;
+        assert_eq!(read_result.is_error, Some(true));
+
+        // Recover by creating the file
+        let write_tool = ToolUse {
+            id: "write_1".to_string(),
+            name: "write".to_string(),
+            input: serde_json::json!({
+                "file_path": temp_dir.path().join("nonexistent.txt").to_str().unwrap(),
+                "content": "now it exists"
+            }),
+        };
+
+        let write_result = executor.execute(&write_tool).await;
+        assert_eq!(write_result.is_error, None);
+
+        // Try reading again
+        let read_result2 = executor.execute(&read_tool).await;
+        assert_eq!(read_result2.is_error, None);
+        assert!(read_result2.content.contains("now it exists"));
+    }
+
+    #[tokio::test]
+    async fn test_integration_task_partial_failure_handling() {
+        let temp_dir = TempDir::new().unwrap();
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+
+        // Task with stop_on_error=false should continue after failures
+        let task_tool = ToolUse {
+            id: "task_1".to_string(),
+            name: "task".to_string(),
+            input: serde_json::json!({
+                "description": "Mixed success and failure",
+                "execution_mode": "sequential",
+                "stop_on_error": false,
+                "steps": [
+                    {
+                        "name": "Success step 1",
+                        "command": "echo 'step1'"
+                    },
+                    {
+                        "name": "Failing step",
+                        "command": "exit 1"
+                    },
+                    {
+                        "name": "Success step 2",
+                        "command": "echo 'step2'"
+                    },
+                    {
+                        "name": "Another failure",
+                        "command": "exit 1"
+                    },
+                    {
+                        "name": "Success step 3",
+                        "command": "echo 'step3'"
+                    }
+                ]
+            }),
+        };
+
+        let task_result = executor.execute(&task_tool).await;
+        assert_eq!(task_result.is_error, Some(true));
+        assert!(task_result.content.contains("3 succeeded, 2 failed"));
     }
 }

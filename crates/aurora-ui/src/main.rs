@@ -3,12 +3,11 @@
 //! This is the main executable for the AuroraHeart IDE, a Windows-native IDE
 //! with first-class AI agent integration built in Rust with Slint.
 
-use aurora_agent::{AnthropicClient, Conversation, StreamEvent};
+use aurora_agent::{AgenticEvent, AnthropicClient, Conversation, ToolExecutor};
 use aurora_core::{
     detect_language, find_project_root, get_project_name, read_file, write_file, Config,
     ConfigError, CredentialStore,
 };
-use futures::StreamExt;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -279,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     ));
 
-    // Set up chat message callback
+    // Set up chat message callback with agentic loop
     let window_weak_chat = main_window.as_weak();
     let project_root_chat = project_root.clone();
     let conversation_clone = conversation.clone();
@@ -319,101 +318,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Create client and clone conversation for API call
+            // Create client
             let client = AnthropicClient::new(api_key);
-            let conversation_for_api = conversation_clone.lock().unwrap().clone();
 
-            // Clone window weak and conversation for async task
+            // Clone window weak, conversation, and project root for async task
             let window_weak_async = window_weak_chat.clone();
             let conversation_async = conversation_clone.clone();
+            let project_root_async = project_root_chat.clone();
 
-            // Spawn async task to send message and stream response
+            // Spawn async task to run agentic loop
             tokio::spawn(async move {
-                match client.send_conversation_stream(&conversation_for_api).await {
-                    Ok(mut stream) => {
-                        let mut accumulated_text = String::new();
+                // Create tool executor inside async block
+                let executor = ToolExecutor::with_working_directory(project_root_async);
 
-                        while let Some(event_result) = stream.next().await {
-                            match event_result {
-                                Ok(StreamEvent::ContentBlockDelta { delta, .. }) => {
-                                    let aurora_agent::Delta::TextDelta { text } = delta;
-                                    accumulated_text.push_str(&text);
+                // Clone conversation for agentic loop (it will be mutated)
+                let mut conv = conversation_async.lock().unwrap().clone();
 
-                                    // Update UI with accumulated text
-                                    let text_clone = accumulated_text.clone();
-                                    let output_base = new_output.clone();
-                                    let window_weak_clone = window_weak_async.clone();
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        if let Some(w) = window_weak_clone.upgrade() {
-                                            let display_text = format!("{}{}", output_base, text_clone);
-                                            w.set_chat_output(display_text.into());
-                                        }
-                                    });
-                                }
-                                Ok(StreamEvent::MessageStop) => {
-                                    tracing::info!("Stream completed");
+                match client.run_agentic_loop(&mut conv, &executor, None).await {
+                    Ok(events) => {
+                        // Format and display events
+                        let mut output = new_output.clone();
+                        let mut final_text = String::new();
 
-                                    // Save assistant's response to conversation
-                                    if !accumulated_text.is_empty() {
-                                        if let Ok(mut conv) = conversation_async.lock() {
-                                            conv.add_assistant_message(&accumulated_text);
-                                            tracing::debug!("Added assistant message to conversation");
-                                        }
-                                    }
-
-                                    let window_weak_clone = window_weak_async.clone();
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        if let Some(w) = window_weak_clone.upgrade() {
-                                            w.set_status_message("Message complete".into());
-                                        }
-                                    });
-                                    break;
+                        for event in &events {
+                            match event {
+                                AgenticEvent::ToolCall { id, name, input } => {
+                                    let tool_info = format!("\n[🔧 Tool: {} (id: {})]\n", name, id);
+                                    output.push_str(&tool_info);
+                                    tracing::info!("Tool call: {} with input: {:?}", name, input);
                                 }
-                                Ok(StreamEvent::Error { error }) => {
-                                    tracing::error!("Stream error: {:?}", error);
-                                    let error_msg = format!("\n\n⚠ {}", error.message);
-                                    let output_base = new_output.clone();
-                                    let accumulated = accumulated_text.clone();
-                                    let window_weak_clone = window_weak_async.clone();
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        if let Some(w) = window_weak_clone.upgrade() {
-                                            let display = format!("{}{}{}", output_base, accumulated, error_msg);
-                                            w.set_chat_output(display.into());
-                                            w.set_status_message("Error occurred".into());
-                                        }
-                                    });
-                                    break;
+                                AgenticEvent::ToolResult { tool_use_id, content, is_error } => {
+                                    let result_prefix = if is_error == &Some(true) {
+                                        "❌ Error"
+                                    } else {
+                                        "✓ Result"
+                                    };
+                                    // Truncate long tool results for display
+                                    let display_content = if content.len() > 200 {
+                                        format!("{}... ({} chars)", &content[..200], content.len())
+                                    } else {
+                                        content.clone()
+                                    };
+                                    let tool_result = format!("[{}: {}]\n", result_prefix, display_content);
+                                    output.push_str(&tool_result);
+                                    tracing::info!("Tool result for {}: {} chars", tool_use_id, content.len());
                                 }
-                                Ok(_) => {
-                                    // Other events like Ping, MessageStart, etc.
-                                }
-                                Err(e) => {
-                                    tracing::error!("Stream error: {:?}", e);
-                                    let error_msg = format!("\n\n⚠ {}", e.user_message());
-                                    let output_base = new_output.clone();
-                                    let accumulated = accumulated_text.clone();
-                                    let window_weak_clone = window_weak_async.clone();
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        if let Some(w) = window_weak_clone.upgrade() {
-                                            let display = format!("{}{}{}", output_base, accumulated, error_msg);
-                                            w.set_chat_output(display.into());
-                                            w.set_status_message("Error".into());
-                                        }
-                                    });
-                                    break;
+                                AgenticEvent::TextResponse { text } => {
+                                    final_text.push_str(text);
                                 }
                             }
                         }
+
+                        // Add final text response
+                        output.push_str(&final_text);
+
+                        // Update conversation with the modified version
+                        {
+                            let mut conversation_lock = conversation_async.lock().unwrap();
+                            *conversation_lock = conv;
+                        }
+
+                        // Update UI
+                        let output_final = output.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = window_weak_async.upgrade() {
+                                w.set_chat_output(output_final.into());
+                                w.set_status_message("Message complete".into());
+                            }
+                        });
+
+                        tracing::info!("Agentic loop completed with {} events", events.len());
                     }
                     Err(e) => {
-                        tracing::error!("Failed to send message: {:?}", e);
-                        let error_msg = format!("\n\n⚠ {}", e.user_message());
+                        tracing::error!("Agentic loop error: {:?}", e);
+                        let error_msg = format!("\n\n⚠ Error: {}", e);
                         let output_base = new_output.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(w) = window_weak_async.upgrade() {
                                 let display = format!("{}{}", output_base, error_msg);
                                 w.set_chat_output(display.into());
-                                w.set_status_message("Failed".into());
+                                w.set_status_message("Error occurred".into());
                             }
                         });
                     }
