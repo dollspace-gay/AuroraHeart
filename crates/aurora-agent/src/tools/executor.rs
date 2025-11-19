@@ -69,6 +69,7 @@ impl ToolExecutor {
             "copy" => self.execute_copy(&tool_use.input).await,
             "delete" => self.execute_delete(&tool_use.input).await,
             "move" => self.execute_move(&tool_use.input).await,
+            "build" => self.execute_build(&tool_use.input).await,
             unknown => Err(ToolError::ToolNotFound(unknown.to_string())),
         };
 
@@ -1777,6 +1778,140 @@ impl ToolExecutor {
             source_path.display(),
             dest_path.display()
         ))
+    }
+
+    /// Execute the Build tool
+    async fn execute_build(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let build_type = input["build_type"].as_str().unwrap_or("debug");
+        let custom_command = input["custom_command"].as_str();
+
+        // Get working directory
+        let working_dir = if let Some(wd) = input["working_directory"].as_str() {
+            let path = Path::new(wd);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.working_directory.join(path)
+            }
+        } else {
+            self.working_directory.clone()
+        };
+
+        // Detect or use specified project type
+        let project_type = if let Some(pt) = input["project_type"].as_str() {
+            pt.to_lowercase()
+        } else {
+            self.detect_build_project_type(&working_dir)?
+        };
+
+        // Build the command
+        let mut command = if project_type == "custom" {
+            if let Some(cmd) = custom_command {
+                cmd.to_string()
+            } else {
+                return Err(ToolError::InvalidInput(
+                    "custom_command is required when project_type is 'custom'".to_string(),
+                ));
+            }
+        } else {
+            self.get_build_command(&project_type, build_type)?
+        };
+
+        // Add additional arguments
+        if let Some(args) = input["args"].as_array() {
+            for arg in args {
+                if let Some(arg_str) = arg.as_str() {
+                    command.push(' ');
+                    command.push_str(arg_str);
+                }
+            }
+        }
+
+        // Execute the build command
+        let output = tokio::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+            .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+            .arg(&command)
+            .current_dir(&working_dir)
+            .output()
+            .await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() {
+            let mut result = format!("✅ Build succeeded ({})\n", project_type);
+            result.push_str(&format!("Command: {}\n\n", command));
+            if !stdout.is_empty() {
+                result.push_str("Output:\n");
+                result.push_str(&stdout);
+            }
+            Ok(result)
+        } else {
+            let mut error_msg = format!("❌ Build failed ({})\n", project_type);
+            error_msg.push_str(&format!("Command: {}\n\n", command));
+            if !stderr.is_empty() {
+                error_msg.push_str("Errors:\n");
+                error_msg.push_str(&stderr);
+            }
+            if !stdout.is_empty() {
+                error_msg.push_str("\nOutput:\n");
+                error_msg.push_str(&stdout);
+            }
+            Err(ToolError::CommandFailed(error_msg))
+        }
+    }
+
+    /// Detect project type for build based on project structure
+    fn detect_build_project_type(&self, path: &Path) -> Result<String, ToolError> {
+        // Check for Rust project
+        if path.join("Cargo.toml").exists() {
+            return Ok("rust".to_string());
+        }
+
+        // Check for Node.js project
+        if path.join("package.json").exists() {
+            return Ok("javascript".to_string());
+        }
+
+        // Check for Python project
+        if path.join("setup.py").exists() || path.join("pyproject.toml").exists() {
+            return Ok("python".to_string());
+        }
+
+        // Check for Go project
+        if path.join("go.mod").exists() {
+            return Ok("go".to_string());
+        }
+
+        Err(ToolError::InvalidInput(
+            "Could not detect project type. Please specify project_type explicitly.".to_string(),
+        ))
+    }
+
+    /// Get the appropriate build command for a project type
+    fn get_build_command(&self, project_type: &str, build_type: &str) -> Result<String, ToolError> {
+        match project_type {
+            "rust" => {
+                if build_type == "release" {
+                    Ok("cargo build --release".to_string())
+                } else {
+                    Ok("cargo build".to_string())
+                }
+            }
+            "javascript" | "typescript" => {
+                Ok("npm run build".to_string())
+            }
+            "python" => {
+                Ok("python setup.py build".to_string())
+            }
+            "go" => {
+                Ok("go build".to_string())
+            }
+            _ => Err(ToolError::InvalidInput(format!(
+                "Unsupported project type: {}. Use 'custom' with custom_command instead.",
+                project_type
+            ))),
+        }
     }
 }
 
@@ -3620,5 +3755,250 @@ fn main() {
         assert!(dest_file.exists());
         let content = tokio::fs::read_to_string(&dest_file).await.unwrap();
         assert_eq!(content, "test content");
+    }
+
+    // Build Tool Tests
+
+    #[tokio::test]
+    async fn test_build_rust_debug() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml to simulate Rust project
+        tokio::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "test-project"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        // Build will likely fail without src/, but we're testing detection and command construction
+        assert!(result.content.contains("rust"));
+        assert!(result.content.contains("cargo build"));
+    }
+
+    #[tokio::test]
+    async fn test_build_rust_release() {
+        let temp_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "test-project"
+version = "0.1.0"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({
+                "build_type": "release"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("rust"));
+        assert!(result.content.contains("cargo build --release"));
+    }
+
+    #[tokio::test]
+    async fn test_build_custom_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({
+                "project_type": "custom",
+                "custom_command": "echo test build"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, None);
+        assert!(result.content.contains("Build succeeded"));
+        assert!(result.content.contains("custom"));
+    }
+
+    #[tokio::test]
+    async fn test_build_with_additional_args() {
+        let temp_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({
+                "args": ["--verbose", "--features", "test-feature"]
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("cargo build --verbose --features test-feature"));
+    }
+
+    #[tokio::test]
+    async fn test_build_nodejs_project() {
+        let temp_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"name": "test", "scripts": {"build": "echo building"}}"#,
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("javascript"));
+        assert!(result.content.contains("npm run build"));
+    }
+
+    #[tokio::test]
+    async fn test_build_python_project() {
+        let temp_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            temp_dir.path().join("setup.py"),
+            "from setuptools import setup\nsetup(name='test')",
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("python"));
+        assert!(result.content.contains("python setup.py build"));
+    }
+
+    #[tokio::test]
+    async fn test_build_go_project() {
+        let temp_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            temp_dir.path().join("go.mod"),
+            "module test\n\ngo 1.20",
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("go"));
+        assert!(result.content.contains("go build"));
+    }
+
+    #[tokio::test]
+    async fn test_build_no_project_detected() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("Could not detect project type"));
+    }
+
+    #[tokio::test]
+    async fn test_build_custom_without_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({
+                "project_type": "custom"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content.contains("custom_command is required"));
+    }
+
+    #[tokio::test]
+    async fn test_build_with_working_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("subproject");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+
+        tokio::fs::write(
+            subdir.join("Cargo.toml"),
+            "[package]\nname = \"subtest\"",
+        )
+        .await
+        .unwrap();
+
+        let executor = ToolExecutor::with_working_directory(temp_dir.path());
+        let tool_use = ToolUse {
+            id: "test_123".to_string(),
+            name: "build".to_string(),
+            input: serde_json::json!({
+                "working_directory": "subproject"
+            }),
+        };
+
+        let result = executor.execute(&tool_use).await;
+
+        assert!(result.content.contains("rust"));
+        assert!(result.content.contains("cargo build"));
     }
 }

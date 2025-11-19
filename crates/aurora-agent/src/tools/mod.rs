@@ -437,6 +437,45 @@ pub fn move_tool() -> Tool {
     }
 }
 
+/// Create the Build tool definition
+pub fn build_tool() -> Tool {
+    Tool {
+        name: "build".to_string(),
+        description: "Execute build commands for various project types. Supports Rust (cargo build), JavaScript/TypeScript (npm run build), Python (python setup.py build), Go (go build), and custom build commands.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "project_type": {
+                    "type": "string",
+                    "description": "Optional project type override (rust, javascript, typescript, python, go). If not specified, detected from project structure.",
+                    "enum": ["rust", "javascript", "typescript", "python", "go", "custom"]
+                },
+                "build_type": {
+                    "type": "string",
+                    "description": "Build configuration type: 'debug' or 'release' (default: 'debug')",
+                    "enum": ["debug", "release"]
+                },
+                "custom_command": {
+                    "type": "string",
+                    "description": "Custom build command to execute (used when project_type is 'custom')"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Additional arguments to pass to the build command"
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Working directory for the build (defaults to current directory)"
+                }
+            },
+            "required": []
+        }),
+    }
+}
+
 /// Get all available tools
 pub fn all_tools() -> Vec<Tool> {
     vec![
@@ -454,6 +493,7 @@ pub fn all_tools() -> Vec<Tool> {
         copy_tool(),
         delete_tool(),
         move_tool(),
+        build_tool(),
     ]
 }
 
@@ -510,7 +550,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));
@@ -527,6 +567,7 @@ mod tests {
         assert!(tool_names.contains(&"copy".to_string()));
         assert!(tool_names.contains(&"delete".to_string()));
         assert!(tool_names.contains(&"move".to_string()));
+        assert!(tool_names.contains(&"build".to_string()));
     }
 
     #[test]
