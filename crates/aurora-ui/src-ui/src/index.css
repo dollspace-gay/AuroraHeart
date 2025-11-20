@@ -1,0 +1,140 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'JetBrains Mono', 'Consolas', 'Monaco', monospace;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #0B0C15;
+  color: #E8E8E8;
+  overflow: hidden;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+/* Aurora Background Blobs - Cyan/Teal and Purple/Magenta tones */
+.aurora-blob {
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.3;
+  pointer-events: none;
+  z-index: -1;
+  mix-blend-mode: screen;
+}
+
+.aurora-blob-1 {
+  width: 1400px;
+  height: 1200px;
+  top: -300px;
+  left: -400px;
+  background: radial-gradient(circle, rgba(0, 217, 255, 0.5) 0%, rgba(0, 255, 179, 0.3) 40%, transparent 70%);
+}
+
+.aurora-blob-2 {
+  width: 1000px;
+  height: 1000px;
+  top: -200px;
+  right: -200px;
+  background: radial-gradient(circle, rgba(178, 75, 243, 0.6) 0%, rgba(189, 0, 255, 0.4) 40%, transparent 70%);
+}
+
+.aurora-blob-3 {
+  width: 900px;
+  height: 900px;
+  top: 33%;
+  right: -100px;
+  background: radial-gradient(circle, rgba(0, 217, 255, 0.55) 0%, rgba(0, 255, 204, 0.35) 40%, transparent 70%);
+}
+
+.aurora-blob-4 {
+  width: 1200px;
+  height: 1000px;
+  bottom: -400px;
+  left: -300px;
+  background: radial-gradient(circle, rgba(0, 255, 179, 0.5) 0%, rgba(0, 217, 255, 0.3) 40%, transparent 70%);
+}
+
+.aurora-blob-5 {
+  width: 1100px;
+  height: 1100px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, rgba(178, 75, 243, 0.4) 0%, rgba(189, 0, 255, 0.2) 40%, transparent 70%);
+}
+
+.aurora-blob-6 {
+  width: 1300px;
+  height: 1100px;
+  bottom: -500px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: radial-gradient(circle, rgba(0, 217, 255, 0.5) 0%, rgba(0, 217, 255, 0.3) 40%, transparent 70%);
+}
+
+/* Glassmorphism Panel with stronger blur */
+.glass-panel {
+  background: rgba(19, 21, 36, 0.5);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glass-panel-light {
+  background: rgba(25, 27, 42, 0.4);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Neon Glow Effects - Updated colors */
+.glow-green {
+  box-shadow: 0 0 20px rgba(0, 255, 179, 0.4);
+}
+
+.glow-purple {
+  box-shadow: 0 0 20px rgba(178, 75, 243, 0.4);
+}
+
+.glow-blue {
+  box-shadow: 0 0 20px rgba(0, 217, 255, 0.4);
+}
+
+/* Scrollbar Styling - Updated to match new theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(11, 12, 21, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 217, 255, 0.3);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 217, 255, 0.5);
+}
+
+/* Transitions */
+.transition-glow {
+  transition: box-shadow 0.3s ease, background 0.3s ease;
+}

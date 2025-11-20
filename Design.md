@@ -4,7 +4,7 @@
 
 **Product Name:** AuroraHeart (RustAgent Studio)
 **Target Platform:** Windows
-**Core Technology:** Rust (Application Logic) + High-Performance Rust GUI Framework (Slint/Iced/Floem)
+**Core Technology:** Rust (Application Logic) + Tauri v2 with React + Tailwind CSS
 **Goal:** To build the fastest, most resource-efficient IDE on Windows that treats AI coding agents not as a plugin, but as a **first-class co-author**. The design prioritizes performance, security, and a "human-in-the-loop" workflow.
 
 ---
@@ -130,10 +130,10 @@ Based on project requirements and long-term goals:
 
 | Component | Technology Choice | Rationale |
 |-----------|------------------|-----------|
-| **GUI Framework** | Slint | Mature, declarative UI, excellent Windows support |
+| **GUI Framework** | Tauri v2 with React + Tailwind CSS | True glassmorphism with backdrop-filter, web stack flexibility |
 | **AI Provider** | Anthropic Claude (via API) | Feature parity with Claude Code VSCode plugin |
-| **Text Editor (Phase 1)** | Slint TextEdit | Quick start with built-in component |
-| **Text Editor (Phase 2+)** | lapce-core or xi-rope | Battle-tested, high-performance rope-based editing |
+| **Text Editor (Phase 1)** | react-syntax-highlighter | Syntax highlighting with custom Aurora theme |
+| **Text Editor (Phase 2+)** | Monaco Editor or CodeMirror | Professional editing experience with LSP support |
 | **HTTP Client** | reqwest | Industry standard, async support, streaming |
 | **Async Runtime** | tokio | De facto standard for async Rust |
 | **Vector DB (RAG)** | qdrant-client or lance | Rust-native, actively maintained |
@@ -151,24 +151,26 @@ Based on project requirements and long-term goals:
 
 ## 7. Implementation Roadmap (Phased Approach)
 
-### **Phase 1: Foundation & Basic UI** (Weeks 1-3)
+### **Phase 1: Foundation & Basic UI** (Weeks 1-3) ✅ **COMPLETED**
 
-**Goal**: Get a working Slint window with basic text editing and chat interface
+**Goal**: Get a working Tauri v2 window with basic text editing and chat interface
 
 **Deliverables**:
 - Workspace structure (`aurora-core`, `aurora-ui`, `aurora-agent`)
-- Slint UI with:
-  - Main text editor pane (using Slint's TextEdit)
-  - AI chat panel (side-by-side or bottom pane)
-  - File tree view (basic)
+- Tauri v2 UI with React + Tailwind CSS:
+  - Main text editor pane with syntax highlighting (react-syntax-highlighter)
+  - AI chat panel (bottom pane)
+  - File tree view with folder expansion
 - Basic project configuration system (`.AuroraHeart/config.toml`)
-- Encrypted API key storage (using `aes-gcm` + local file)
+- Encrypted API key storage (using Windows Credential Manager via keytar)
 - Simple file I/O (open/save files)
+- Glassmorphism theme with Aurora Borealis aesthetic
 
 **Success Criteria**:
-- Can open AuroraHeart, see a text editor and chat panel
-- Can configure Claude API key
-- Can type in both panes
+- Can open AuroraHeart, see a syntax-highlighted editor and chat panel
+- Can configure Claude API key securely
+- Can navigate file tree and open files
+- True glassmorphism with backdrop-filter working
 
 ---
 
@@ -380,17 +382,19 @@ AuroraHeart/
 │   │       ├── config.rs      # Configuration management
 │   │       ├── crypto.rs      # Encrypted credential storage
 │   │       └── types.rs       # Shared types
-│   ├── aurora-ui/             # Slint UI and main application
+│   ├── aurora-ui/             # Tauri v2 UI and main application
 │   │   ├── Cargo.toml
-│   │   ├── build.rs           # Slint build script
-│   │   ├── ui/                # Slint files
-│   │   │   ├── main.slint
-│   │   │   ├── editor.slint
-│   │   │   └── chat.slint
+│   │   ├── build.rs           # Tauri build script
+│   │   ├── src-ui/            # React frontend
+│   │   │   ├── src/
+│   │   │   │   ├── App.jsx    # Main React component
+│   │   │   │   ├── index.css  # Global styles & aurora theme
+│   │   │   │   └── main.jsx   # React entry point
+│   │   │   ├── tailwind.config.js
+│   │   │   ├── vite.config.js
+│   │   │   └── package.json
 │   │   └── src/
-│   │       ├── main.rs
-│   │       ├── editor.rs
-│   │       └── file_tree.rs
+│   │       └── main.rs        # Tauri Rust backend
 │   ├── aurora-agent/          # AI agent core
 │   │   ├── Cargo.toml
 │   │   └── src/

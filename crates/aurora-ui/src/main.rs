@@ -1,18 +1,19 @@
-//! AuroraHeart IDE - Main entry point
+//! AuroraHeart IDE - Tauri Backend
 //!
-//! This is the main executable for the AuroraHeart IDE, a Windows-native IDE
-//! with first-class AI agent integration built in Rust with Slint.
+//! This is the Tauri backend for AuroraHeart IDE, providing commands for
+//! file operations, AI agent integration, and credential management.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use aurora_agent::{AgenticEvent, AnthropicClient, Conversation, ToolExecutor};
 use aurora_core::{
     detect_language, find_project_root, get_project_name, read_file, write_file, Config,
     ConfigError, CredentialStore,
 };
-use std::path::Path;
-use std::rc::Rc;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-slint::include_modules!();
+use tauri::State;
 
 /// Initialize tracing for logging
 fn init_tracing() {
@@ -27,8 +28,29 @@ fn init_tracing() {
         .init();
 }
 
+/// File tree item for serialization to frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTreeItem {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+}
+
+/// File open result
+#[derive(Debug, Serialize)]
+pub struct FileOpenResult {
+    pub path: String,
+    pub content: String,
+}
+
+/// Application state shared across Tauri commands
+pub struct AppState {
+    pub project_root: PathBuf,
+    pub conversation: Arc<Mutex<Conversation>>,
+}
+
 /// Load files from current directory into file tree
-fn load_file_tree<P: AsRef<Path>>(dir: P) -> Vec<FileTreeItem> {
+fn load_file_tree_internal<P: AsRef<Path>>(dir: P) -> Vec<FileTreeItem> {
     let mut items = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(dir.as_ref()) {
@@ -49,95 +71,21 @@ fn load_file_tree<P: AsRef<Path>>(dir: P) -> Vec<FileTreeItem> {
             let path_str = path.to_string_lossy().to_string();
 
             items.push(FileTreeItem {
-                name: file_name.into(),
-                path: path_str.into(),
+                name: file_name,
+                path: path_str,
                 is_directory,
             });
         }
     }
 
     // Sort: directories first, then files, both alphabetically
-    items.sort_by(|a, b| {
-        match (a.is_directory, b.is_directory) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    items.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     items
-}
-
-/// Open and display a file in the editor
-fn open_file_in_editor(main_window: &MainWindow, file_path: &str) {
-    match read_file(file_path) {
-        Ok(content) => {
-            main_window.set_editor_text(content.clone().into());
-            main_window.set_original_content(content.into());
-            main_window.set_current_file(file_path.into());
-            main_window.set_is_modified(false);
-
-            let file_name = Path::new(file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file_path);
-
-            main_window.set_status_message(format!("Opened: {}", file_name).into());
-            tracing::info!("Opened file: {}", file_path);
-        }
-        Err(e) => {
-            let error_msg = format!("Error opening file: {}", e);
-            main_window.set_status_message(error_msg.clone().into());
-            tracing::error!("{}", error_msg);
-        }
-    }
-}
-
-/// Save the current file
-fn save_current_file(main_window: &MainWindow) {
-    let current_file = main_window.get_current_file();
-    let content = main_window.get_editor_text();
-
-    if current_file.is_empty() {
-        main_window.set_status_message("No file to save".into());
-        return;
-    }
-
-    match write_file(current_file.as_str(), content.as_str()) {
-        Ok(()) => {
-            // Update original content and clear modified state
-            main_window.set_original_content(content.clone());
-            main_window.set_is_modified(false);
-
-            let file_name = Path::new(current_file.as_str())
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file");
-
-            main_window.set_status_message(format!("Saved: {}", file_name).into());
-            tracing::info!("Saved file: {}", current_file);
-        }
-        Err(e) => {
-            let error_msg = format!("Error saving file: {}", e);
-            main_window.set_status_message(error_msg.clone().into());
-            tracing::error!("{}", error_msg);
-        }
-    }
-}
-
-/// Save API key to encrypted credential store
-fn save_api_key(project_root: &Path, api_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let store = CredentialStore::for_project(project_root);
-    store.store("anthropic_api_key", api_key, "auroraheart")?;
-    tracing::info!("API key saved successfully");
-    Ok(())
-}
-
-/// Load API key from encrypted credential store
-fn load_api_key(project_root: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let store = CredentialStore::for_project(project_root);
-    let api_key = store.retrieve("anthropic_api_key", "auroraheart")?;
-    Ok(api_key)
 }
 
 /// Mask API key for display (show first 7 chars and last 4 chars)
@@ -146,16 +94,248 @@ fn mask_api_key(api_key: &str) -> String {
         return "****".to_string();
     }
 
-    let prefix = &api_key[..7];  // "sk-ant-"
-    let suffix = &api_key[api_key.len()-4..];
+    let prefix = &api_key[..7]; // "sk-ant-"
+    let suffix = &api_key[api_key.len() - 4..];
     format!("{}...{}", prefix, suffix)
 }
+
+// ============================================================================
+// TAURI COMMANDS
+// ============================================================================
+
+/// Get file tree for the project root
+#[tauri::command]
+async fn get_file_tree(state: State<'_, AppState>) -> Result<Vec<FileTreeItem>, String> {
+    tracing::info!("get_file_tree command called");
+    Ok(load_file_tree_internal(&state.project_root))
+}
+
+/// Get directory contents
+#[tauri::command]
+async fn get_directory_contents(path: String) -> Result<Vec<FileTreeItem>, String> {
+    tracing::info!("get_directory_contents command called for: {}", path);
+    Ok(load_file_tree_internal(path))
+}
+
+/// Open a file using native file dialog
+#[tauri::command]
+async fn open_file(app: tauri::AppHandle) -> Result<Option<FileOpenResult>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    tracing::info!("open_file command called");
+
+    // Use Tauri v2 dialog plugin
+    let file_path = app
+        .dialog()
+        .file()
+        .blocking_pick_file();
+
+    if let Some(path) = file_path {
+        // FilePath::as_path() returns Option<&Path>, so we need to handle it
+        if let Some(p) = path.as_path() {
+            let path_str = p.to_string_lossy().to_string();
+            match read_file(&path_str) {
+                Ok(content) => {
+                    tracing::info!("Opened file: {}", path_str);
+                    Ok(Some(FileOpenResult {
+                        path: path_str,
+                        content,
+                    }))
+                }
+                Err(e) => {
+                    let error_msg = format!("Error reading file: {}", e);
+                    tracing::error!("{}", error_msg);
+                    Err(error_msg)
+                }
+            }
+        } else {
+            Err("Invalid file path".to_string())
+        }
+    } else {
+        // User cancelled the dialog
+        Ok(None)
+    }
+}
+
+/// Read a file by path
+#[tauri::command]
+async fn read_file_by_path(path: String) -> Result<String, String> {
+    tracing::info!("read_file_by_path command called for: {}", path);
+
+    read_file(&path).map_err(|e| {
+        let error_msg = format!("Error reading file: {}", e);
+        tracing::error!("{}", error_msg);
+        error_msg
+    })
+}
+
+/// Save file content to disk
+#[tauri::command]
+async fn save_file(path: String, content: String) -> Result<(), String> {
+    tracing::info!("save_file command called for: {}", path);
+
+    write_file(&path, &content).map_err(|e| {
+        let error_msg = format!("Error saving file: {}", e);
+        tracing::error!("{}", error_msg);
+        error_msg
+    })?;
+
+    tracing::info!("File saved successfully: {}", path);
+    Ok(())
+}
+
+/// Save API key to encrypted credential store
+#[tauri::command]
+async fn save_api_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("save_api_key command called");
+
+    let store = CredentialStore::for_project(&state.project_root);
+    store
+        .store("anthropic_api_key", &key, "auroraheart")
+        .map_err(|e| {
+            let error_msg = format!("Failed to save API key: {}", e);
+            tracing::error!("{}", error_msg);
+            error_msg
+        })?;
+
+    tracing::info!("API key saved successfully");
+    Ok(())
+}
+
+/// Load API key from encrypted credential store
+#[tauri::command]
+async fn load_api_key(state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("load_api_key command called");
+
+    let store = CredentialStore::for_project(&state.project_root);
+    store
+        .retrieve("anthropic_api_key", "auroraheart")
+        .map_err(|e| {
+            tracing::debug!("No API key found: {}", e);
+            "No API key configured".to_string()
+        })
+}
+
+/// Send a message to Claude and run the agentic loop
+#[tauri::command]
+async fn send_message(message: String, state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("send_message command called: {}", message);
+
+    // Load API key
+    let store = CredentialStore::for_project(&state.project_root);
+    let api_key = store
+        .retrieve("anthropic_api_key", "auroraheart")
+        .map_err(|e| {
+            let error_msg = "⚠ No API key configured. Please set your API key in Settings.";
+            tracing::error!("Failed to load API key: {}", e);
+            error_msg.to_string()
+        })?;
+
+    // Add user message to conversation and truncate if needed
+    {
+        let mut conv = state.conversation.lock().unwrap();
+        conv.add_user_message(&message);
+        // Keep conversation within reasonable limits (50k tokens = ~200k chars)
+        let removed = conv.truncate_to_tokens(50_000);
+        if removed > 0 {
+            tracing::info!("Truncated {} old messages from conversation", removed);
+        }
+    }
+
+    // Create client
+    let client = AnthropicClient::new(api_key);
+
+    // Create tool executor
+    let executor = ToolExecutor::with_working_directory(state.project_root.clone());
+
+    // Clone conversation for agentic loop
+    let mut conv = state.conversation.lock().unwrap().clone();
+
+    // Run agentic loop
+    let events = client
+        .run_agentic_loop(&mut conv, &executor, None)
+        .await
+        .map_err(|e| {
+            let error_msg = format!("⚠ Error: {}", e);
+            tracing::error!("Agentic loop error: {:?}", e);
+            error_msg
+        })?;
+
+    // Update conversation with the modified version
+    {
+        let mut conversation_lock = state.conversation.lock().unwrap();
+        *conversation_lock = conv;
+    }
+
+    // Format events into response text
+    let mut output = String::new();
+    let mut final_text = String::new();
+
+    for event in &events {
+        match event {
+            AgenticEvent::ToolCall { id, name, input } => {
+                let tool_info = format!("\n[🔧 Tool: {} (id: {})]\n", name, id);
+                output.push_str(&tool_info);
+                tracing::info!("Tool call: {} with input: {:?}", name, input);
+            }
+            AgenticEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let result_prefix = if is_error == &Some(true) {
+                    "❌ Error"
+                } else {
+                    "✓ Result"
+                };
+                // Truncate long tool results for display
+                let display_content = if content.len() > 200 {
+                    format!("{}... ({} chars)", &content[..200], content.len())
+                } else {
+                    content.clone()
+                };
+                let tool_result = format!("[{}: {}]\n", result_prefix, display_content);
+                output.push_str(&tool_result);
+                tracing::info!(
+                    "Tool result for {}: {} chars",
+                    tool_use_id,
+                    content.len()
+                );
+            }
+            AgenticEvent::TextResponse { text } => {
+                final_text.push_str(text);
+            }
+        }
+    }
+
+    // Add final text response
+    output.push_str(&final_text);
+
+    tracing::info!("Agentic loop completed with {} events", events.len());
+    Ok(output)
+}
+
+/// Clear the conversation history
+#[tauri::command]
+async fn clear_chat(state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("clear_chat command called");
+
+    let mut conv = state.conversation.lock().unwrap();
+    conv.clear();
+
+    tracing::info!("Conversation cleared");
+    Ok(())
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     init_tracing();
-    tracing::info!("Starting AuroraHeart IDE");
+    tracing::info!("Starting AuroraHeart IDE (Tauri)");
 
     // Get current directory
     let current_dir = std::env::current_dir()?;
@@ -213,268 +393,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::debug!("Configuration: {:?}", config);
 
-    // Create and configure the main window
-    let main_window = MainWindow::new()?;
-
-    // Set initial state
-    main_window.set_project_name(project_name.clone().into());
-    main_window.set_status_message("Ready".into());
-
-    // Load file tree
-    let file_tree = load_file_tree(&project_root);
-    let file_tree_model = Rc::new(slint::VecModel::from(file_tree));
-    main_window.set_file_tree_items(file_tree_model.into());
-
-    // Load and set masked API key if it exists
-    if let Ok(api_key) = load_api_key(&project_root) {
-        let masked = mask_api_key(&api_key);
-        main_window.set_api_key_masked(masked.into());
-        tracing::info!("Loaded existing API key");
-    }
-
-    // Set welcome message in chat
-    let welcome_message = format!(
-        "Hello! I'm Claude, your AI coding assistant.\n\nProject: {}\n{}Ready to help you code!",
-        project_name,
-        if let Some(lang) = language {
-            format!("Language: {}\n", lang.as_str())
-        } else {
-            String::new()
-        }
-    );
-    main_window.set_chat_output(welcome_message.into());
-
-    // Set up file selection callback
-    let window_weak_file = main_window.as_weak();
-    main_window.on_file_selected(move |file_path| {
-        if let Some(window) = window_weak_file.upgrade() {
-            open_file_in_editor(&window, file_path.as_str());
-        }
-    });
-
-    // Set up open file callback
-    let window_weak_open = main_window.as_weak();
-    main_window.on_open_file(move || {
-        if let Some(window) = window_weak_open.upgrade() {
-            tracing::info!("Open file dialog requested");
-            window.set_status_message("File dialog not yet implemented".into());
-            // TODO: Implement native file dialog in Phase 1 completion
-        }
-    });
-
-    // Set up save file callback
-    let window_weak_save = main_window.as_weak();
-    main_window.on_save_file(move || {
-        if let Some(window) = window_weak_save.upgrade() {
-            save_current_file(&window);
-        }
-    });
-
     // Create persistent conversation with system prompt
-    let conversation = Arc::new(Mutex::new(
-        Conversation::with_system_prompt(
-            "You are Claude, a helpful AI assistant integrated into AuroraHeart IDE. \
-             You help developers with coding tasks, explaining code, debugging, and general programming questions."
-        )
-    ));
+    let conversation = Arc::new(Mutex::new(Conversation::with_system_prompt(
+        "You are Claude, a helpful AI assistant integrated into AuroraHeart IDE. \
+         You help developers with coding tasks, explaining code, debugging, and general programming questions.",
+    )));
 
-    // Set up chat message callback with agentic loop
-    let window_weak_chat = main_window.as_weak();
-    let project_root_chat = project_root.clone();
-    let conversation_clone = conversation.clone();
-    main_window.on_send_message(move |message| {
-        if let Some(window) = window_weak_chat.upgrade() {
-            tracing::info!("Chat message: {}", message);
+    // Create application state
+    let app_state = AppState {
+        project_root,
+        conversation,
+    };
 
-            // Update UI to show user message
-            let current_output = window.get_chat_output();
-            let new_output = format!(
-                "{}\n\n> You: {}\n\nClaude: ",
-                current_output, message
-            );
-            window.set_chat_output(new_output.clone().into());
-            window.set_status_message("Sending message to Claude...".into());
-
-            // Load API key
-            let api_key = match load_api_key(&project_root_chat) {
-                Ok(key) => key,
-                Err(e) => {
-                    let error_msg = format!("{}⚠ No API key configured. Please set your API key in Settings.", new_output);
-                    window.set_chat_output(error_msg.into());
-                    window.set_status_message("API key not found".into());
-                    tracing::error!("Failed to load API key: {}", e);
-                    return;
-                }
-            };
-
-            // Add user message to conversation and truncate if needed
-            {
-                let mut conv = conversation_clone.lock().unwrap();
-                conv.add_user_message(message.as_str());
-                // Keep conversation within reasonable limits (50k tokens = ~200k chars)
-                let removed = conv.truncate_to_tokens(50_000);
-                if removed > 0 {
-                    tracing::info!("Truncated {} old messages from conversation", removed);
-                }
-            }
-
-            // Create client
-            let client = AnthropicClient::new(api_key);
-
-            // Clone window weak, conversation, and project root for async task
-            let window_weak_async = window_weak_chat.clone();
-            let conversation_async = conversation_clone.clone();
-            let project_root_async = project_root_chat.clone();
-
-            // Spawn async task to run agentic loop
-            tokio::spawn(async move {
-                // Create tool executor inside async block
-                let executor = ToolExecutor::with_working_directory(project_root_async);
-
-                // Clone conversation for agentic loop (it will be mutated)
-                let mut conv = conversation_async.lock().unwrap().clone();
-
-                match client.run_agentic_loop(&mut conv, &executor, None).await {
-                    Ok(events) => {
-                        // Format and display events
-                        let mut output = new_output.clone();
-                        let mut final_text = String::new();
-
-                        for event in &events {
-                            match event {
-                                AgenticEvent::ToolCall { id, name, input } => {
-                                    let tool_info = format!("\n[🔧 Tool: {} (id: {})]\n", name, id);
-                                    output.push_str(&tool_info);
-                                    tracing::info!("Tool call: {} with input: {:?}", name, input);
-                                }
-                                AgenticEvent::ToolResult { tool_use_id, content, is_error } => {
-                                    let result_prefix = if is_error == &Some(true) {
-                                        "❌ Error"
-                                    } else {
-                                        "✓ Result"
-                                    };
-                                    // Truncate long tool results for display
-                                    let display_content = if content.len() > 200 {
-                                        format!("{}... ({} chars)", &content[..200], content.len())
-                                    } else {
-                                        content.clone()
-                                    };
-                                    let tool_result = format!("[{}: {}]\n", result_prefix, display_content);
-                                    output.push_str(&tool_result);
-                                    tracing::info!("Tool result for {}: {} chars", tool_use_id, content.len());
-                                }
-                                AgenticEvent::TextResponse { text } => {
-                                    final_text.push_str(text);
-                                }
-                            }
-                        }
-
-                        // Add final text response
-                        output.push_str(&final_text);
-
-                        // Update conversation with the modified version
-                        {
-                            let mut conversation_lock = conversation_async.lock().unwrap();
-                            *conversation_lock = conv;
-                        }
-
-                        // Update UI
-                        let output_final = output.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(w) = window_weak_async.upgrade() {
-                                w.set_chat_output(output_final.into());
-                                w.set_status_message("Message complete".into());
-                            }
-                        });
-
-                        tracing::info!("Agentic loop completed with {} events", events.len());
-                    }
-                    Err(e) => {
-                        tracing::error!("Agentic loop error: {:?}", e);
-                        let error_msg = format!("\n\n⚠ Error: {}", e);
-                        let output_base = new_output.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(w) = window_weak_async.upgrade() {
-                                let display = format!("{}{}", output_base, error_msg);
-                                w.set_chat_output(display.into());
-                                w.set_status_message("Error occurred".into());
-                            }
-                        });
-                    }
-                }
-            });
-        }
-    });
-
-    // Set up text editing callback to detect changes
-    let window_weak_edit = main_window.as_weak();
-    main_window.on_text_edited(move || {
-        if let Some(window) = window_weak_edit.upgrade() {
-            let current_text = window.get_editor_text();
-            let original_text = window.get_original_content();
-            let is_modified = current_text != original_text;
-            window.set_is_modified(is_modified);
-        }
-    });
-
-    // Set up save API key callback
-    let project_root_save = project_root.clone();
-    let window_weak_save_key = main_window.as_weak();
-    main_window.on_save_api_key(move |api_key| {
-        if let Some(window) = window_weak_save_key.upgrade() {
-            match save_api_key(&project_root_save, api_key.as_str()) {
-                Ok(()) => {
-                    let masked = mask_api_key(api_key.as_str());
-                    window.set_api_key_masked(masked.into());
-                    window.set_status_message("API key saved successfully".into());
-                    tracing::info!("API key saved via UI");
-                }
-                Err(e) => {
-                    let error_msg = format!("Failed to save API key: {}", e);
-                    window.set_status_message(error_msg.clone().into());
-                    tracing::error!("{}", error_msg);
-                }
-            }
-        }
-    });
-
-    // Set up load API key callback
-    let project_root_load = project_root.clone();
-    main_window.on_load_api_key(move || {
-        match load_api_key(&project_root_load) {
-            Ok(api_key) => {
-                tracing::info!("API key loaded via UI");
-                api_key.into()
-            }
-            Err(_) => {
-                tracing::debug!("No API key found");
-                "".into()
-            }
-        }
-    });
-
-    // Set up clear chat callback
-    let window_weak_clear = main_window.as_weak();
-    let conversation_clear = conversation.clone();
-    main_window.on_clear_chat(move || {
-        if let Some(window) = window_weak_clear.upgrade() {
-            // Clear the conversation state
-            if let Ok(mut conv) = conversation_clear.lock() {
-                conv.clear();
-                tracing::info!("Conversation cleared");
-            }
-
-            // Reset the chat UI with welcome message
-            let welcome_message = format!(
-                "Hello! I'm Claude, your AI coding assistant.\n\nConversation cleared. Ready to help you code!"
-            );
-            window.set_chat_output(welcome_message.into());
-            window.set_status_message("Chat cleared".into());
-        }
-    });
-
-    tracing::info!("Running main window");
-    main_window.run()?;
+    // Build and run Tauri application
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(app_state)
+        .invoke_handler(tauri::generate_handler![
+            get_file_tree,
+            get_directory_contents,
+            open_file,
+            read_file_by_path,
+            save_file,
+            send_message,
+            save_api_key,
+            load_api_key,
+            clear_chat,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 
     tracing::info!("AuroraHeart IDE shutting down");
     Ok(())
