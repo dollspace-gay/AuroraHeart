@@ -32,6 +32,7 @@ pub enum ToolError {
 }
 
 /// Tool executor that can execute tool requests
+#[derive(Clone)]
 pub struct ToolExecutor {
     /// Working directory for file operations
     working_directory: std::path::PathBuf,
@@ -58,6 +59,7 @@ impl ToolExecutor {
             "read" => self.execute_read(&tool_use.input).await,
             "write" => self.execute_write(&tool_use.input).await,
             "edit" => self.execute_edit(&tool_use.input).await,
+            "multi_edit" => self.execute_multi_edit(&tool_use.input).await,
             "bash" => self.execute_bash(&tool_use.input).await,
             "grep" => self.execute_grep(&tool_use.input).await,
             "glob" => self.execute_glob(&tool_use.input).await,
@@ -165,6 +167,104 @@ impl ToolExecutor {
         Ok(format!(
             "Successfully replaced string in {}",
             file_path
+        ))
+    }
+
+    /// Execute the MultiEdit tool - apply edits to multiple files atomically
+    async fn execute_multi_edit(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let edits = input["edits"]
+            .as_array()
+            .ok_or_else(|| ToolError::InvalidInput("Missing edits array".to_string()))?;
+
+        if edits.is_empty() {
+            return Err(ToolError::InvalidInput("Edits array cannot be empty".to_string()));
+        }
+
+        // Phase 1: Validate all edit objects and collect file paths
+        let mut edit_ops: Vec<(std::path::PathBuf, String, String, String)> = Vec::new();
+
+        for edit in edits {
+            let file_path = edit["file_path"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput("Missing file_path in edit".to_string()))?;
+
+            let old_string = edit["old_string"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput("Missing old_string in edit".to_string()))?;
+
+            let new_string = edit["new_string"]
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidInput("Missing new_string in edit".to_string()))?;
+
+            let path = Path::new(file_path);
+            let absolute_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.working_directory.join(path)
+            };
+
+            // Check file exists
+            if !absolute_path.exists() {
+                return Err(ToolError::InvalidInput(format!(
+                    "File not found: {}",
+                    file_path
+                )));
+            }
+
+            edit_ops.push((absolute_path, old_string.to_string(), new_string.to_string(), file_path.to_string()));
+        }
+
+        // Phase 2: Read all files and validate old_string exists
+        let mut original_contents: Vec<String> = Vec::new();
+
+        for (absolute_path, old_string, _, file_path) in &edit_ops {
+            let contents = tokio::fs::read_to_string(absolute_path).await?;
+
+            if !contents.contains(old_string) {
+                return Err(ToolError::InvalidInput(format!(
+                    "String not found in file {}: {}",
+                    file_path, old_string
+                )));
+            }
+
+            original_contents.push(contents);
+        }
+
+        // Phase 3: Apply all edits
+        let mut success_count = 0;
+        let mut results = Vec::new();
+
+        for (i, (absolute_path, old_string, new_string, file_path)) in edit_ops.iter().enumerate() {
+            let contents = &original_contents[i];
+            let new_contents = contents.replace(old_string, new_string);
+
+            // Attempt to write the file
+            match tokio::fs::write(absolute_path, &new_contents).await {
+                Ok(_) => {
+                    success_count += 1;
+                    results.push(format!("✓ {}", file_path));
+                }
+                Err(e) => {
+                    // Rollback all previous successful edits
+                    for (j, (rollback_path, _, _, _)) in edit_ops.iter().enumerate() {
+                        if j < i {
+                            // Ignore rollback errors - best effort
+                            let _ = tokio::fs::write(rollback_path, &original_contents[j]).await;
+                        }
+                    }
+
+                    return Err(ToolError::CommandFailed(format!(
+                        "Failed to write {}: {}. All edits rolled back.",
+                        file_path, e
+                    )));
+                }
+            }
+        }
+
+        Ok(format!(
+            "Successfully edited {} file(s):\n{}",
+            success_count,
+            results.join("\n")
         ))
     }
 

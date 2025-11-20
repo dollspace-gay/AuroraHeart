@@ -130,6 +130,42 @@ pub fn edit_tool() -> Tool {
     }
 }
 
+/// Create the MultiEdit tool definition
+pub fn multi_edit_tool() -> Tool {
+    Tool {
+        name: "multi_edit".to_string(),
+        description: "Apply the same edit operation across multiple files atomically. All edits succeed or all are rolled back.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "description": "Array of edit operations to perform",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "The absolute path to the file to edit"
+                            },
+                            "old_string": {
+                                "type": "string",
+                                "description": "The exact string to replace in this file"
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "The string to replace it with"
+                            }
+                        },
+                        "required": ["file_path", "old_string", "new_string"]
+                    }
+                }
+            },
+            "required": ["edits"]
+        }),
+    }
+}
+
 /// Create the Bash tool definition
 pub fn bash_tool() -> Tool {
     Tool {
@@ -621,6 +657,7 @@ pub fn all_tools() -> Vec<Tool> {
         read_tool(),
         write_tool(),
         edit_tool(),
+        multi_edit_tool(),
         bash_tool(),
         grep_tool(),
         glob_tool(),
@@ -692,7 +729,7 @@ mod tests {
     #[test]
     fn test_all_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         assert!(tool_names.contains(&"read".to_string()));

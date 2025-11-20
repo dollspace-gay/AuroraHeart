@@ -5,6 +5,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod terminal;
+
 use aurora_agent::{AgenticEvent, AnthropicClient, Conversation, ToolExecutor};
 use aurora_core::{
     detect_language, find_project_root, get_project_name, read_file, write_file, Config,
@@ -14,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use terminal::{ShellType, TerminalId, TerminalManager};
 
 /// Initialize tracing for logging
 fn init_tracing() {
@@ -47,6 +50,7 @@ pub struct FileOpenResult {
 pub struct AppState {
     pub project_root: PathBuf,
     pub conversation: Arc<Mutex<Conversation>>,
+    pub terminal_manager: TerminalManager,
 }
 
 /// Load files from current directory into file tree
@@ -328,6 +332,351 @@ async fn clear_chat(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 // ============================================================================
+// TERMINAL COMMANDS
+// ============================================================================
+
+/// Get list of available shells on the system
+#[tauri::command]
+async fn get_available_shells() -> Result<Vec<ShellType>, String> {
+    tracing::info!("get_available_shells command called");
+    Ok(TerminalManager::detect_available_shells())
+}
+
+/// Get the default shell for the platform
+#[tauri::command]
+async fn get_default_shell() -> Result<ShellType, String> {
+    tracing::info!("get_default_shell command called");
+    Ok(TerminalManager::default_shell())
+}
+
+/// Spawn a new terminal session
+#[tauri::command]
+async fn spawn_terminal(
+    shell_type: ShellType,
+    cols: u16,
+    rows: u16,
+    state: State<'_, AppState>,
+) -> Result<TerminalId, String> {
+    tracing::info!(
+        "spawn_terminal command called: {:?} ({}x{})",
+        shell_type,
+        cols,
+        rows
+    );
+
+    state
+        .terminal_manager
+        .spawn_terminal(shell_type, cols, rows)
+        .map_err(|e| {
+            let error_msg = format!("Failed to spawn terminal: {}", e);
+            tracing::error!("{}", error_msg);
+            error_msg
+        })
+}
+
+/// Write data to terminal
+#[tauri::command]
+async fn write_terminal(
+    id: TerminalId,
+    data: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::debug!("write_terminal command called: {} ({} bytes)", id, data.len());
+
+    state.terminal_manager.write_terminal(&id, &data).map_err(|e| {
+        let error_msg = format!("Failed to write to terminal: {}", e);
+        tracing::error!("{}", error_msg);
+        error_msg
+    })
+}
+
+/// Read available data from terminal
+#[tauri::command]
+async fn read_terminal(id: TerminalId, state: State<'_, AppState>) -> Result<String, String> {
+    tracing::debug!("read_terminal command called: {}", id);
+
+    state.terminal_manager.read_terminal(&id).map_err(|e| {
+        let error_msg = format!("Failed to read from terminal: {}", e);
+        tracing::error!("{}", error_msg);
+        error_msg
+    })
+}
+
+/// Resize terminal
+#[tauri::command]
+async fn resize_terminal(
+    id: TerminalId,
+    cols: u16,
+    rows: u16,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!("resize_terminal command called: {} ({}x{})", id, cols, rows);
+
+    state
+        .terminal_manager
+        .resize_terminal(&id, cols, rows)
+        .map_err(|e| {
+            let error_msg = format!("Failed to resize terminal: {}", e);
+            tracing::error!("{}", error_msg);
+            error_msg
+        })
+}
+
+/// Close terminal session
+#[tauri::command]
+async fn close_terminal(id: TerminalId, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("close_terminal command called: {}", id);
+
+    state.terminal_manager.close_terminal(&id).map_err(|e| {
+        let error_msg = format!("Failed to close terminal: {}", e);
+        tracing::error!("{}", error_msg);
+        error_msg
+    })
+}
+
+/// List all active terminal IDs
+#[tauri::command]
+async fn list_terminals(state: State<'_, AppState>) -> Result<Vec<TerminalId>, String> {
+    tracing::info!("list_terminals command called");
+    Ok(state.terminal_manager.list_terminals())
+}
+
+// ============================================================================
+// GIT COMMANDS
+// ============================================================================
+
+/// Git status information
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitStatus {
+    pub branch: Option<String>,
+    pub modified: Vec<String>,
+    pub staged: Vec<String>,
+    pub untracked: Vec<String>,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+/// Get git status for the project
+#[tauri::command]
+async fn get_git_status(state: State<'_, AppState>) -> Result<GitStatus, String> {
+    tracing::info!("get_git_status command called");
+
+    let project_root = &state.project_root;
+
+    // Get current branch
+    let branch_output = std::process::Command::new("git")
+        .args(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_root)
+        .output();
+
+    let branch = match branch_output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => None,
+    }
+    .filter(|s| !s.is_empty());
+
+    // Get status
+    let status_output = std::process::Command::new("git")
+        .args(&["status", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("Failed to run git status: {}", e))?;
+
+    let mut modified = Vec::new();
+    let mut staged = Vec::new();
+    let mut untracked = Vec::new();
+
+    if status_output.status.success() {
+        let status_str = String::from_utf8_lossy(&status_output.stdout);
+        for line in status_str.lines() {
+            if line.len() < 3 {
+                continue;
+            }
+            let status_code = &line[..2];
+            let file_path = line[3..].to_string();
+
+            match status_code {
+                "??" => untracked.push(file_path),
+                " M" | " D" => modified.push(file_path),
+                "M " | "A " | "D " | "R " | "C " => staged.push(file_path),
+                "MM" | "AM" | "AD" => {
+                    staged.push(file_path.clone());
+                    modified.push(file_path);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Get ahead/behind count
+    let ahead_behind_output = std::process::Command::new("git")
+        .args(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+        .current_dir(project_root)
+        .output();
+
+    let (ahead, behind) = match ahead_behind_output {
+        Ok(output) if output.status.success() => {
+            let counts = String::from_utf8_lossy(&output.stdout);
+            let parts: Vec<&str> = counts.trim().split_whitespace().collect();
+            if parts.len() == 2 {
+                (
+                    parts[0].parse().unwrap_or(0),
+                    parts[1].parse().unwrap_or(0),
+                )
+            } else {
+                (0, 0)
+            }
+        }
+        _ => (0, 0),
+    };
+
+    Ok(GitStatus {
+        branch,
+        modified,
+        staged,
+        untracked,
+        ahead,
+        behind,
+    })
+}
+
+/// Check if a file has git modifications
+#[tauri::command]
+async fn is_file_modified(path: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let project_root = &state.project_root;
+
+    let output = std::process::Command::new("git")
+        .args(&["status", "--porcelain", &path])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("Failed to check git status: {}", e))?;
+
+    Ok(output.status.success() && !output.stdout.is_empty())
+}
+
+/// Stage files for commit
+#[tauri::command]
+async fn git_stage(files: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("git_stage command called for {} files", files.len());
+    let project_root = &state.project_root;
+
+    for file in &files {
+        let output = std::process::Command::new("git")
+            .args(&["add", file])
+            .current_dir(project_root)
+            .output()
+            .map_err(|e| format!("Failed to stage file: {}", e))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to stage {}: {}", file, error));
+        }
+    }
+
+    Ok(())
+}
+
+/// Unstage files
+#[tauri::command]
+async fn git_unstage(files: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("git_unstage command called for {} files", files.len());
+    let project_root = &state.project_root;
+
+    for file in &files {
+        let output = std::process::Command::new("git")
+            .args(&["restore", "--staged", file])
+            .current_dir(project_root)
+            .output()
+            .map_err(|e| format!("Failed to unstage file: {}", e))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to unstage {}: {}", file, error));
+        }
+    }
+
+    Ok(())
+}
+
+/// Create a git commit
+#[tauri::command]
+async fn git_commit(message: String, amend: bool, state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("git_commit command called: amend={}", amend);
+    let project_root = &state.project_root;
+
+    let mut args = vec!["commit", "-m", &message];
+    if amend {
+        args.push("--amend");
+    }
+
+    let output = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("Failed to create commit: {}", e))?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Commit failed: {}", error));
+    }
+
+    let result = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(result)
+}
+
+/// Push commits to remote
+#[tauri::command]
+async fn git_push(remote: Option<String>, branch: Option<String>, state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("git_push command called");
+    let project_root = &state.project_root;
+
+    let mut args = vec!["push"];
+    if let Some(ref r) = remote {
+        args.push(r);
+    }
+    if let Some(ref b) = branch {
+        args.push(b);
+    }
+
+    let output = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("Failed to push: {}", e))?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Push failed: {}", error));
+    }
+
+    let result = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(result)
+}
+
+/// Pull changes from remote
+#[tauri::command]
+async fn git_pull(state: State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("git_pull command called");
+    let project_root = &state.project_root;
+
+    let output = std::process::Command::new("git")
+        .args(&["pull"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("Failed to pull: {}", e))?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Pull failed: {}", error));
+    }
+
+    let result = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(result)
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -399,10 +748,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          You help developers with coding tasks, explaining code, debugging, and general programming questions.",
     )));
 
+    // Create terminal manager
+    let terminal_manager = TerminalManager::new();
+
     // Create application state
     let app_state = AppState {
         project_root,
         conversation,
+        terminal_manager,
     };
 
     // Build and run Tauri application
@@ -419,6 +772,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             save_api_key,
             load_api_key,
             clear_chat,
+            get_available_shells,
+            get_default_shell,
+            spawn_terminal,
+            write_terminal,
+            read_terminal,
+            resize_terminal,
+            close_terminal,
+            list_terminals,
+            get_git_status,
+            is_file_modified,
+            git_stage,
+            git_unstage,
+            git_commit,
+            git_push,
+            git_pull,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

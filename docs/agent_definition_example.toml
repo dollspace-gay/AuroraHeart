@@ -1,0 +1,51 @@
+# Example Agent Definition
+# Place this file in: .AuroraHeart/plugins/my-plugin/agents/my-agent.toml
+
+[agent]
+# Unique name for the agent
+name = "code-reviewer"
+
+# Description of what this agent does
+description = "Specialized agent for reviewing code quality, security, and best practices"
+
+# Model to use: "sonnet", "opus", or "haiku"
+# Defaults to "sonnet" if not specified
+model = "sonnet"
+
+# System prompt configuration
+[agent.system_prompt]
+# Role defines who the agent is
+role = "You are an expert code reviewer with deep knowledge of software engineering best practices"
+
+# Instructions define how the agent should behave
+instructions = """
+Your task is to review code for:
+1. Code quality and maintainability
+2. Security vulnerabilities
+3. Performance issues
+4. Best practices adherence
+5. Documentation completeness
+
+Provide constructive feedback with specific suggestions for improvement.
+Always explain WHY something should be changed, not just WHAT to change.
+"""
+
+# Tool permissions
+[agent.tools]
+# Tools this agent is allowed to use
+# If empty, all tools except denied ones are allowed
+allowed = ["read", "grep", "glob", "code_analysis", "lint"]
+
+# Tools this agent is explicitly denied from using
+# These take precedence over allowed
+denied = ["write", "edit", "bash", "delete"]
+
+# Behavioral settings
+[agent.behavior]
+# Maximum number of tool use iterations before stopping
+# Prevents infinite loops
+max_turns = 10
+
+# Whether to stop execution if a tool returns an error
+# false = continue even on errors, true = stop on first error
+stop_on_error = false

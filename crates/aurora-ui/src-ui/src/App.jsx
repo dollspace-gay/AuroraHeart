@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { TerminalPanel } from './Terminal'
 
 // Custom Aurora syntax theme
 const auroraTheme = {
@@ -97,21 +98,184 @@ function FileTreeItem({ item, level = 0, onFileClick, currentFile, expandedFolde
 }
 
 function App() {
-  const [currentFile, setCurrentFile] = useState('')
-  const [editorText, setEditorText] = useState('')
+  // Git status state
+  const [gitStatus, setGitStatus] = useState(null)
+
+  // Multi-tab state: array of {path, content, isModified, isEditing, undoStack, redoStack}
+  const [tabs, setTabs] = useState([])
+  const [activeTabIndex, setActiveTabIndex] = useState(-1)
   const [chatInput, setChatInput] = useState('')
   const [chatOutput, setChatOutput] = useState('')
-  const [isModified, setIsModified] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [fileTree, setFileTree] = useState([])
   const [expandedFolders, setExpandedFolders] = useState(new Set())
-  const [isEditing, setIsEditing] = useState(false)
+
+  // Debounce timer for undo history
+  const undoDebounceTimer = useRef(null)
+
+  // Search and replace state
+  const [showSearch, setShowSearch] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [replaceText, setReplaceText] = useState('')
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false)
+  const [searchRegex, setSearchRegex] = useState(false)
+  const [searchMatches, setSearchMatches] = useState([])
+  const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
+
+  // Derived state for current tab
+  const activeTab = activeTabIndex >= 0 ? tabs[activeTabIndex] : null
+  const currentFile = activeTab?.path || ''
+  const editorText = activeTab?.content || ''
+  const isModified = activeTab?.isModified || false
+  const isEditing = activeTab?.isEditing || false
 
   // Load file tree on mount
   useEffect(() => {
     loadFileTree()
   }, [])
+
+  // Load git status periodically
+  useEffect(() => {
+    const fetchGitStatus = async () => {
+      try {
+        const status = await invoke('get_git_status')
+        setGitStatus(status)
+      } catch (err) {
+        // Not a git repo or git not available
+        setGitStatus(null)
+      }
+    }
+
+    // Initial fetch
+    fetchGitStatus()
+
+    // Refresh every 5 seconds
+    const interval = setInterval(fetchGitStatus, 5000)
+
+    return () => clearInterval(interval)
+  }, [])
+
+  // Search for matches when query or options change
+  useEffect(() => {
+    if (!searchQuery || !editorText || !showSearch) {
+      setSearchMatches([])
+      setCurrentMatchIndex(-1)
+      return
+    }
+
+    try {
+      const matches = []
+      if (searchRegex) {
+        // Regex search
+        const flags = searchCaseSensitive ? 'g' : 'gi'
+        const regex = new RegExp(searchQuery, flags)
+        let match
+        while ((match = regex.exec(editorText)) !== null) {
+          matches.push({ index: match.index, length: match[0].length })
+        }
+      } else {
+        // Literal string search
+        const searchText = searchCaseSensitive ? editorText : editorText.toLowerCase()
+        const query = searchCaseSensitive ? searchQuery : searchQuery.toLowerCase()
+        let index = searchText.indexOf(query)
+        while (index !== -1) {
+          matches.push({ index, length: searchQuery.length })
+          index = searchText.indexOf(query, index + 1)
+        }
+      }
+      setSearchMatches(matches)
+      setCurrentMatchIndex(matches.length > 0 ? 0 : -1)
+    } catch (error) {
+      // Invalid regex
+      setSearchMatches([])
+      setCurrentMatchIndex(-1)
+    }
+  }, [searchQuery, editorText, searchCaseSensitive, searchRegex, showSearch])
+
+  // Keyboard shortcuts for tab switching, undo/redo, saving, and search
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Escape - Close search panel
+      if (e.key === 'Escape' && showSearch) {
+        e.preventDefault()
+        setShowSearch(false)
+        return
+      }
+
+      // Ctrl+F - Open find
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault()
+        setShowSearch(true)
+        return
+      }
+
+      // Ctrl+H - Open find and replace
+      if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
+        e.preventDefault()
+        setShowSearch(true)
+        return
+      }
+
+      // Ctrl+Z - Undo
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        handleUndo()
+        return
+      }
+
+      // Ctrl+Y or Ctrl+Shift+Z - Redo
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault()
+        handleRedo()
+        return
+      }
+
+      // Ctrl+W or Cmd+W - Close active tab
+      if ((e.ctrlKey || e.metaKey) && e.key === 'w') {
+        e.preventDefault()
+        if (activeTabIndex >= 0) {
+          handleCloseTab(activeTabIndex)
+        }
+      }
+
+      // Ctrl+Tab - Next tab
+      if (e.ctrlKey && e.key === 'Tab' && !e.shiftKey) {
+        e.preventDefault()
+        if (tabs.length > 0) {
+          setActiveTabIndex((activeTabIndex + 1) % tabs.length)
+        }
+      }
+
+      // Ctrl+Shift+Tab - Previous tab
+      if (e.ctrlKey && e.shiftKey && e.key === 'Tab') {
+        e.preventDefault()
+        if (tabs.length > 0) {
+          setActiveTabIndex((activeTabIndex - 1 + tabs.length) % tabs.length)
+        }
+      }
+
+      // Ctrl+1-9 - Switch to specific tab
+      if ((e.ctrlKey || e.metaKey) && e.key >= '1' && e.key <= '9') {
+        e.preventDefault()
+        const tabIndex = parseInt(e.key) - 1
+        if (tabIndex < tabs.length) {
+          setActiveTabIndex(tabIndex)
+        }
+      }
+
+      // Ctrl+S - Save file
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault()
+        if (activeTab && activeTab.isModified) {
+          handleSaveFile()
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [tabs, activeTabIndex])
 
   const loadFileTree = async () => {
     try {
@@ -159,10 +323,22 @@ function App() {
     try {
       const result = await invoke('open_file')
       if (result) {
-        setCurrentFile(result.path)
-        setEditorText(result.content)
-        setIsModified(false)
-        setIsEditing(false)
+        // Check if file is already open
+        const existingTabIndex = tabs.findIndex(tab => tab.path === result.path)
+        if (existingTabIndex >= 0) {
+          setActiveTabIndex(existingTabIndex)
+        } else {
+          // Add new tab with undo/redo stacks
+          setTabs([...tabs, {
+            path: result.path,
+            content: result.content,
+            isModified: false,
+            isEditing: false,
+            undoStack: [],
+            redoStack: []
+          }])
+          setActiveTabIndex(tabs.length)
+        }
       }
     } catch (error) {
       console.error('Failed to open file:', error)
@@ -170,12 +346,187 @@ function App() {
   }
 
   const handleSaveFile = async () => {
+    if (!activeTab) return
     try {
-      await invoke('save_file', { path: currentFile, content: editorText })
-      setIsModified(false)
+      await invoke('save_file', { path: activeTab.path, content: activeTab.content })
+      // Update tab to mark as not modified
+      const newTabs = [...tabs]
+      newTabs[activeTabIndex] = { ...activeTab, isModified: false }
+      setTabs(newTabs)
     } catch (error) {
       console.error('Failed to save file:', error)
     }
+  }
+
+  const handleCloseTab = (index, e) => {
+    e?.stopPropagation()
+    const newTabs = tabs.filter((_, i) => i !== index)
+    setTabs(newTabs)
+
+    if (index === activeTabIndex) {
+      // Closing active tab - switch to previous or next tab
+      if (newTabs.length === 0) {
+        setActiveTabIndex(-1)
+      } else if (index >= newTabs.length) {
+        setActiveTabIndex(newTabs.length - 1)
+      } else {
+        setActiveTabIndex(index)
+      }
+    } else if (index < activeTabIndex) {
+      // Closing a tab before the active one - adjust index
+      setActiveTabIndex(activeTabIndex - 1)
+    }
+  }
+
+  const handleTabContentChange = (newContent) => {
+    if (!activeTab) return
+
+    // Clear any existing debounce timer
+    if (undoDebounceTimer.current) {
+      clearTimeout(undoDebounceTimer.current)
+    }
+
+    // Update content immediately
+    const newTabs = [...tabs]
+    newTabs[activeTabIndex] = {
+      ...activeTab,
+      content: newContent,
+      isModified: true
+    }
+    setTabs(newTabs)
+
+    // Debounce undo stack update (300ms delay)
+    undoDebounceTimer.current = setTimeout(() => {
+      const tab = tabs[activeTabIndex]
+      if (!tab) return
+
+      // Initialize stacks if they don't exist
+      const undoStack = tab.undoStack || []
+      const previousContent = tab.content
+
+      // Only add to undo stack if content actually changed
+      if (previousContent !== newContent) {
+        // Add current content to undo stack (limit to 50 entries)
+        const newUndoStack = [...undoStack, previousContent].slice(-50)
+
+        // Update tab with new undo stack and clear redo stack
+        const updatedTabs = [...tabs]
+        updatedTabs[activeTabIndex] = {
+          ...updatedTabs[activeTabIndex],
+          undoStack: newUndoStack,
+          redoStack: [] // Clear redo stack on new change
+        }
+        setTabs(updatedTabs)
+      }
+    }, 300)
+  }
+
+  const handleUndo = () => {
+    if (!activeTab) return
+
+    const undoStack = activeTab.undoStack || []
+    if (undoStack.length === 0) return
+
+    // Pop from undo stack
+    const newUndoStack = [...undoStack]
+    const previousContent = newUndoStack.pop()
+
+    // Push current content to redo stack
+    const redoStack = activeTab.redoStack || []
+    const newRedoStack = [...redoStack, activeTab.content].slice(-50)
+
+    // Update tab
+    const newTabs = [...tabs]
+    newTabs[activeTabIndex] = {
+      ...activeTab,
+      content: previousContent,
+      undoStack: newUndoStack,
+      redoStack: newRedoStack,
+      isModified: true
+    }
+    setTabs(newTabs)
+  }
+
+  const handleRedo = () => {
+    if (!activeTab) return
+
+    const redoStack = activeTab.redoStack || []
+    if (redoStack.length === 0) return
+
+    // Pop from redo stack
+    const newRedoStack = [...redoStack]
+    const nextContent = newRedoStack.pop()
+
+    // Push current content to undo stack
+    const undoStack = activeTab.undoStack || []
+    const newUndoStack = [...undoStack, activeTab.content].slice(-50)
+
+    // Update tab
+    const newTabs = [...tabs]
+    newTabs[activeTabIndex] = {
+      ...activeTab,
+      content: nextContent,
+      undoStack: newUndoStack,
+      redoStack: newRedoStack,
+      isModified: true
+    }
+    setTabs(newTabs)
+  }
+
+  const handleFindNext = () => {
+    if (searchMatches.length === 0) return
+    setCurrentMatchIndex((currentMatchIndex + 1) % searchMatches.length)
+  }
+
+  const handleFindPrevious = () => {
+    if (searchMatches.length === 0) return
+    setCurrentMatchIndex((currentMatchIndex - 1 + searchMatches.length) % searchMatches.length)
+  }
+
+  const handleReplace = () => {
+    if (!activeTab || currentMatchIndex < 0 || currentMatchIndex >= searchMatches.length) return
+
+    const match = searchMatches[currentMatchIndex]
+    const newContent =
+      editorText.substring(0, match.index) +
+      replaceText +
+      editorText.substring(match.index + match.length)
+
+    handleTabContentChange(newContent)
+
+    // After replacing, move to next match
+    if (currentMatchIndex < searchMatches.length - 1) {
+      setCurrentMatchIndex(currentMatchIndex)
+    } else {
+      setCurrentMatchIndex(-1)
+    }
+  }
+
+  const handleReplaceAll = () => {
+    if (!activeTab || searchMatches.length === 0) return
+
+    // Replace all matches in reverse order to maintain indices
+    let newContent = editorText
+    for (let i = searchMatches.length - 1; i >= 0; i--) {
+      const match = searchMatches[i]
+      newContent =
+        newContent.substring(0, match.index) +
+        replaceText +
+        newContent.substring(match.index + match.length)
+    }
+
+    handleTabContentChange(newContent)
+    setCurrentMatchIndex(-1)
+  }
+
+  const handleToggleEdit = () => {
+    if (!activeTab) return
+    const newTabs = [...tabs]
+    newTabs[activeTabIndex] = {
+      ...activeTab,
+      isEditing: !activeTab.isEditing
+    }
+    setTabs(newTabs)
   }
 
   const handleSendMessage = async () => {
@@ -206,12 +557,25 @@ function App() {
   const handleFileClick = async (item) => {
     if (item.is_directory) return
 
+    // Check if file is already open in a tab
+    const existingTabIndex = tabs.findIndex(tab => tab.path === item.path)
+    if (existingTabIndex >= 0) {
+      setActiveTabIndex(existingTabIndex)
+      return
+    }
+
+    // Open new tab with undo/redo stacks
     try {
       const content = await invoke('read_file_by_path', { path: item.path })
-      setCurrentFile(item.path)
-      setEditorText(content)
-      setIsModified(false)
-      setIsEditing(false)
+      setTabs([...tabs, {
+        path: item.path,
+        content: content,
+        isModified: false,
+        isEditing: false,
+        undoStack: [],
+        redoStack: []
+      }])
+      setActiveTabIndex(tabs.length)
     } catch (error) {
       console.error('Failed to open file:', error)
     }
@@ -262,7 +626,7 @@ function App() {
       <div className="aurora-blob aurora-blob-6" />
 
       {/* Main Layout */}
-      <div className="w-full h-full flex flex-col">
+      <div className="w-full h-full flex flex-col overflow-hidden">
         {/* Glassmorphic Toolbar */}
         <div className="glass-panel h-12 flex items-center px-6 gap-6 relative">
           {/* Top aurora glow */}
@@ -344,22 +708,145 @@ function App() {
           </div>
 
           {/* Editor Area */}
-          <div className="flex-1 flex flex-col">
-            {/* Editor Tab */}
-            {currentFile && (
-              <div className="glass-panel h-11 flex items-center px-4 gap-2 border-b border-white/10">
-                {isModified && (
-                  <div className="w-2.5 h-2.5 rounded-full bg-aurora-green glow-green" />
-                )}
-                <span className="text-sm">{currentFile.split(/[\\/]/).pop()}</span>
-                {!isEditing && (
-                  <button
-                    onClick={() => setIsEditing(true)}
-                    className="ml-auto text-xs glass-panel px-3 py-1 rounded hover:glow-blue transition-glow"
+          <div className="flex-1 flex flex-col relative">
+            {/* Search Panel */}
+            {showSearch && (
+              <div className="absolute top-0 right-0 z-50 m-4">
+                <div className="glass-panel rounded-lg p-4 border border-glacial-blue/25 glow-blue min-w-96">
+                  {/* Search Input */}
+                  <div className="flex gap-2 mb-3">
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Find..."
+                      className="flex-1 glass-panel rounded px-3 py-2 text-sm outline-none text-text-white"
+                      style={{ caretColor: '#00FFB3' }}
+                      autoFocus
+                    />
+                    <button
+                      onClick={() => setShowSearch(false)}
+                      className="glass-panel w-10 h-10 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+                      title="Close (Esc)"
+                    >
+                      <span>✕</span>
+                    </button>
+                  </div>
+
+                  {/* Replace Input */}
+                  <div className="flex gap-2 mb-3">
+                    <input
+                      type="text"
+                      value={replaceText}
+                      onChange={(e) => setReplaceText(e.target.value)}
+                      placeholder="Replace..."
+                      className="flex-1 glass-panel rounded px-3 py-2 text-sm outline-none text-text-white"
+                      style={{ caretColor: '#00FFB3' }}
+                    />
+                  </div>
+
+                  {/* Options */}
+                  <div className="flex gap-4 mb-3">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={searchCaseSensitive}
+                        onChange={(e) => setSearchCaseSensitive(e.target.checked)}
+                        className="w-4 h-4"
+                      />
+                      <span className="text-xs text-text-dim">Case Sensitive</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={searchRegex}
+                        onChange={(e) => setSearchRegex(e.target.checked)}
+                        className="w-4 h-4"
+                      />
+                      <span className="text-xs text-text-dim">Regex</span>
+                    </label>
+                  </div>
+
+                  {/* Match Info and Buttons */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-text-dim flex-1">
+                      {searchMatches.length > 0
+                        ? `${currentMatchIndex + 1} of ${searchMatches.length}`
+                        : searchQuery
+                        ? 'No matches'
+                        : ''}
+                    </span>
+                    <button
+                      onClick={handleFindPrevious}
+                      disabled={searchMatches.length === 0}
+                      className="glass-panel px-3 py-1 rounded text-xs hover:bg-white/10 transition-colors disabled:opacity-30"
+                      title="Previous (Shift+Enter)"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      onClick={handleFindNext}
+                      disabled={searchMatches.length === 0}
+                      className="glass-panel px-3 py-1 rounded text-xs hover:bg-white/10 transition-colors disabled:opacity-30"
+                      title="Next (Enter)"
+                    >
+                      ↓
+                    </button>
+                    <button
+                      onClick={handleReplace}
+                      disabled={currentMatchIndex < 0}
+                      className="glass-panel px-3 py-1 rounded text-xs hover:glow-green transition-glow disabled:opacity-30"
+                    >
+                      Replace
+                    </button>
+                    <button
+                      onClick={handleReplaceAll}
+                      disabled={searchMatches.length === 0}
+                      className="glass-panel px-3 py-1 rounded text-xs hover:glow-green transition-glow disabled:opacity-30"
+                    >
+                      Replace All
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Tab Bar */}
+            {tabs.length > 0 && (
+              <div className="glass-panel flex items-center border-b border-white/10 overflow-x-auto">
+                {tabs.map((tab, index) => (
+                  <div
+                    key={index}
+                    onClick={() => setActiveTabIndex(index)}
+                    className={`flex items-center gap-2 px-4 h-11 border-r border-white/10 cursor-pointer transition-colors group ${
+                      index === activeTabIndex
+                        ? 'bg-glacial-blue/10 border-b-2 border-glacial-blue'
+                        : 'hover:bg-white/5'
+                    }`}
                   >
-                    Edit
-                  </button>
-                )}
+                    {tab.isModified && (
+                      <div className="w-2 h-2 rounded-full bg-aurora-green glow-green" />
+                    )}
+                    <span className="text-sm whitespace-nowrap">{tab.path.split(/[\\/]/).pop()}</span>
+                    <button
+                      onClick={(e) => handleCloseTab(index, e)}
+                      className="ml-2 w-5 h-5 rounded flex items-center justify-center hover:bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <span className="text-xs">✕</span>
+                    </button>
+                    {index === activeTabIndex && !tab.isEditing && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleToggleEdit()
+                        }}
+                        className="ml-1 text-xs glass-panel px-2 py-1 rounded hover:glow-blue transition-glow"
+                      >
+                        Edit
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
             )}
 
@@ -380,10 +867,7 @@ function App() {
                       {/* Editor */}
                       <textarea
                         value={editorText}
-                        onChange={(e) => {
-                          setEditorText(e.target.value)
-                          setIsModified(true)
-                        }}
+                        onChange={(e) => handleTabContentChange(e.target.value)}
                         className="flex-1 bg-transparent text-text-white font-mono text-sm p-4 outline-none resize-none"
                         style={{ caretColor: '#00FFB3', lineHeight: '1.5' }}
                       />
@@ -524,6 +1008,11 @@ function App() {
           </div>
         </div>
 
+        {/* Terminal Panel */}
+        <div className="glass-panel border-t border-white/10 h-64 flex-shrink-0">
+          <TerminalPanel />
+        </div>
+
         {/* Glassmorphic Status Bar */}
         <div className="glass-panel h-7 flex items-center px-6 gap-4 border-t border-white/10 relative">
           <div
@@ -538,6 +1027,45 @@ function App() {
           </div>
           <div className="w-px h-4 bg-white/10" />
           <span className="text-text-dim text-xs">{isEditing ? 'Editing' : 'Ready'}</span>
+
+          {/* Git Status */}
+          {gitStatus && gitStatus.branch && (
+            <>
+              <div className="w-px h-4 bg-white/10" />
+              <div className="flex items-center gap-2">
+                <span className="text-xs">🌿</span>
+                <span className="text-glacial-blue text-xs font-semibold">{gitStatus.branch}</span>
+                {gitStatus.ahead > 0 && (
+                  <span className="text-aurora-green text-xs">↑{gitStatus.ahead}</span>
+                )}
+                {gitStatus.behind > 0 && (
+                  <span className="text-orange-400 text-xs">↓{gitStatus.behind}</span>
+                )}
+              </div>
+              {(gitStatus.modified.length > 0 || gitStatus.staged.length > 0 || gitStatus.untracked.length > 0) && (
+                <>
+                  <div className="w-px h-4 bg-white/10" />
+                  <div className="flex items-center gap-3">
+                    {gitStatus.modified.length > 0 && (
+                      <span className="text-orange-400 text-xs" title={`${gitStatus.modified.length} modified files`}>
+                        M {gitStatus.modified.length}
+                      </span>
+                    )}
+                    {gitStatus.staged.length > 0 && (
+                      <span className="text-aurora-green text-xs" title={`${gitStatus.staged.length} staged files`}>
+                        + {gitStatus.staged.length}
+                      </span>
+                    )}
+                    {gitStatus.untracked.length > 0 && (
+                      <span className="text-text-dim text-xs" title={`${gitStatus.untracked.length} untracked files`}>
+                        ? {gitStatus.untracked.length}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+            </>
+          )}
         </div>
       </div>
 

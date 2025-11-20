@@ -1,0 +1,83 @@
+instructions are being sent to Claude through three primary mechanisms: Session Hooks (which modify the main session behavior), Agent Definitions (which define specialized personas for specific tasks), and Command Instructions (which provide step-by-step procedures).
+
+1. Session Hooks (Global Instructions)
+These plugins use a SessionStart hook to inject specific behavioral instructions into Claude's context at the beginning of a session.
+
+Explanatory Output Style
+
+Source: plugins/explanatory-output-style/hooks-handlers/session-start.sh
+
+Instruction: "You are in 'explanatory' output style mode... provide educational insights about the codebase as you help with the user's task."
+
+Specific Directive: Before and after writing code, Claude must provide an "Insight" block:
+
+`★ Insight ─────────────────────────────────────`
+[2-3 key educational points]
+`─────────────────────────────────────────────────`
+Learning Output Style
+
+Source: plugins/learning-output-style/hooks-handlers/session-start.sh
+
+Instruction: "You are in 'learning' output style mode... instead of implementing everything yourself, identify opportunities where the user can write 5-10 lines of meaningful code."
+
+Specific Directive: Claude is instructed to ask the user to implement business logic or design choices, while handling boilerplate itself. It also includes the "Explanatory" mode insights.
+
+2. Agent Definitions (Specialized Personas)
+These files define "Sub-Agents" with specific system prompts, roles, and responsibilities.
+
+Feature Development Agents (plugins/feature-dev/agents/)
+
+code-architect: "You are a senior software architect... deliver comprehensive, actionable architecture blueprints."
+
+code-explorer: "You are an expert code analyst specializing in tracing and understanding feature implementations..."
+
+code-reviewer: "You are an expert code reviewer... review code against project guidelines in CLAUDE.md with high precision."
+
+PR Review Toolkit Agents (plugins/pr-review-toolkit/agents/)
+
+silent-failure-hunter: "You are an elite error handling auditor with zero tolerance for silent failures..."
+
+comment-analyzer: "You are a meticulous code comment analyzer... protect codebases from comment rot..."
+
+pr-test-analyzer: "You are an expert test coverage analyst... ensure that PRs have adequate test coverage..."
+
+type-design-analyzer: "You are a type design expert... evaluating type designs with a critical eye toward invariant strength..."
+
+code-simplifier: "You are an expert code simplification specialist focused on enhancing code clarity... while preserving exact functionality."
+
+Plugin Development Agents (plugins/plugin-dev/agents/)
+
+agent-creator: "You are an elite AI agent architect specializing in crafting high-performance agent configurations."
+
+plugin-validator: "You are an expert plugin validator specializing in comprehensive validation of Claude Code plugin structure..."
+
+skill-reviewer: "You are an expert skill architect specializing in reviewing and improving Claude Code skills..."
+
+Other Agents
+
+conversation-analyzer (Hookify): "You are a conversation analysis specialist that identifies problematic behaviors... that could be prevented with hooks."
+
+agent-sdk-verifier (SDK Dev): "You are a [Python/TypeScript] Agent SDK application verifier."
+
+3. Command Instructions (Task Workflows)
+Specific slash commands contain prompt logic to guide Claude through complex multi-step tasks.
+
+/code-review (plugins/code-review/commands/code-review.md):
+
+Instructs Claude to launch 5 parallel agents to review code for CLAUDE.md compliance, bugs, history, previous PRs, and comments.
+
+Then launches a "Haiku agent" to score issues from 0-100 based on confidence.
+
+Instruction: "Filter out any issues with a score less than 80."
+
+/ralph-loop (plugins/ralph-wiggum/commands/ralph-loop.md):
+
+Instruction: "When you try to exit, the Ralph loop will feed the SAME PROMPT back to you for the next iteration... If a completion promise is set, you may ONLY output it when the statement is completely and unequivocally TRUE."
+
+/commit-push-pr (plugins/commit-commands/commands/commit-push-pr.md):
+
+Instruction: "You MUST do all of the above [branch, commit, push, pr] in a single message. Do not use any other tools or do anything else."
+
+/oncall-triage (.claude/commands/oncall-triage.md):
+
+Instruction: "You're an oncall triage assistant... identify critical issues that require immediate oncall attention... Be conservative - only flag issues that truly prevent users from getting work done."

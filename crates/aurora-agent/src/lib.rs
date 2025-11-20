@@ -5,12 +5,15 @@
 //! - Tool system (Read, Write, Edit, Bash, Grep, Glob, Task)
 //! - Conversation management
 //! - Directive loading and assembly
+//! - Agent spawning and execution with custom prompts
 
 pub mod client;
 pub mod tools;
 pub mod conversation;
 pub mod directives;
+pub mod agent;
 
+pub use agent::{AgentContext, AgentError, AgentExecutor, FilteredToolExecutor};
 pub use client::{AnthropicClient, ClientError, StreamEvent, Delta, ApiError, MessageRequest, MessageResponse, ContentBlock, AgenticEvent};
 pub use conversation::{Conversation, Message, MessageContent, Role};
 pub use directives::DirectiveManager;
