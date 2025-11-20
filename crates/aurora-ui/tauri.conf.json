@@ -18,11 +18,25 @@
         "resizable": true,
         "fullscreen": false,
         "transparent": true,
-        "decorations": true
+        "decorations": true,
+        "label": "main"
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "description": "Main window capability with event system access",
+          "windows": ["main"],
+          "permissions": [
+            "core:event:allow-listen",
+            "core:event:allow-emit",
+            "core:event:allow-emit-to",
+            "core:event:default"
+          ]
+        }
+      ]
     }
   },
   "bundle": {

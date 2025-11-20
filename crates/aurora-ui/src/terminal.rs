@@ -1,13 +1,15 @@
 //! Integrated Terminal Module
 //!
 //! Provides terminal emulation with support for PowerShell, WSL, and CMD on Windows.
-//! Uses portable-pty for cross-platform PTY support.
+//! Uses portable-pty for cross-platform PTY support with event-based output.
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use tauri::{AppHandle, Emitter};
 use thiserror::Error;
 
 /// Terminal ID type for identifying terminal sessions
@@ -25,7 +27,7 @@ pub enum ShellType {
 
 /// Terminal session data
 pub struct TerminalSession {
-    /// PTY master for reading/writing
+    /// PTY master for resizing
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// PTY writer (cloned from master)
     writer: Box<dyn Write + Send>,
@@ -39,6 +41,7 @@ pub struct TerminalSession {
 pub struct TerminalManager {
     sessions: Arc<Mutex<HashMap<TerminalId, TerminalSession>>>,
     next_id: Arc<Mutex<usize>>,
+    app_handle: AppHandle,
 }
 
 /// Terminal errors
@@ -65,10 +68,11 @@ pub enum TerminalError {
 
 impl TerminalManager {
     /// Create a new terminal manager
-    pub fn new() -> Self {
+    pub fn new(app_handle: AppHandle) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(0)),
+            app_handle,
         }
     }
 
@@ -137,6 +141,7 @@ impl TerminalManager {
         shell_type: ShellType,
         cols: u16,
         rows: u16,
+        working_dir: Option<String>,
     ) -> Result<TerminalId, TerminalError> {
         let pty_system = native_pty_system();
 
@@ -155,6 +160,11 @@ impl TerminalManager {
         // Build command based on shell type
         let mut cmd = self.build_shell_command(&shell_type)?;
 
+        // Set working directory if provided
+        if let Some(dir) = working_dir {
+            cmd.cwd(dir);
+        }
+
         // Spawn the shell process
         let _child = pair
             .slave
@@ -170,6 +180,15 @@ impl TerminalManager {
             .take_writer()
             .map_err(|e| TerminalError::SpawnFailed(format!("Failed to get writer: {}", e)))?;
 
+        // Get reader from master for background thread
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| TerminalError::SpawnFailed(format!("Failed to get reader: {}", e)))?;
+
+        // Generate ID
+        let id = self.next_id();
+
         // Create session
         let session = TerminalSession {
             master: pair.master,
@@ -178,9 +197,63 @@ impl TerminalManager {
             size,
         };
 
-        // Generate ID and store session
-        let id = self.next_id();
+        // Store session
         self.sessions.lock().unwrap().insert(id.clone(), session);
+
+        // Spawn background thread to read output and emit events
+        let terminal_id = id.clone();
+        let app_handle = self.app_handle.clone();
+
+        thread::spawn(move || {
+            tracing::info!("Terminal {} reader thread started", terminal_id);
+            let mut buffer = [0u8; 4096];
+
+            loop {
+                // Use the raw reader directly without BufReader
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        // EOF - terminal closed
+                        tracing::info!("Terminal {} closed (EOF)", terminal_id);
+                        if let Err(e) = app_handle.emit_to("main", &format!("terminal-{}-closed", terminal_id), ()) {
+                            tracing::error!("Failed to emit close event: {}", e);
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        // Got data - emit it to frontend
+                        tracing::debug!("Terminal {} read {} bytes", terminal_id, n);
+
+                        // Convert to string, replacing invalid UTF-8 with replacement character
+                        let data = String::from_utf8_lossy(&buffer[..n]).to_string();
+
+                        tracing::debug!("Terminal {} emitting output: {:?}", terminal_id, &data[..data.len().min(50)]);
+
+                        // Emit to main window
+                        if let Err(e) = app_handle.emit_to("main", &format!("terminal-{}-output", terminal_id), data) {
+                            tracing::error!("Failed to emit output for terminal {}: {}", terminal_id, e);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No data available, sleep briefly and try again
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to read from terminal {}: {} (kind: {:?})", terminal_id, e, e.kind());
+                        if let Err(emit_err) = app_handle.emit_to(
+                            "main",
+                            &format!("terminal-{}-error", terminal_id),
+                            format!("Read error: {}", e),
+                        ) {
+                            tracing::error!("Failed to emit error event: {}", emit_err);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            tracing::info!("Terminal {} reader thread exiting", terminal_id);
+        });
 
         tracing::info!("Spawned terminal {} with shell {:?}", id, shell_type);
         Ok(id)
@@ -188,7 +261,7 @@ impl TerminalManager {
 
     /// Build shell command based on shell type
     fn build_shell_command(&self, shell_type: &ShellType) -> Result<CommandBuilder, TerminalError> {
-        let mut cmd = match shell_type {
+        let cmd = match shell_type {
             #[cfg(target_os = "windows")]
             ShellType::PowerShell => {
                 let mut cmd = CommandBuilder::new("powershell.exe");
@@ -249,36 +322,6 @@ impl TerminalManager {
         Ok(())
     }
 
-    /// Read available data from terminal (non-blocking)
-    pub fn read_terminal(&self, id: &TerminalId) -> Result<String, TerminalError> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions
-            .get_mut(id)
-            .ok_or_else(|| TerminalError::NotFound(id.clone()))?;
-
-        // Try to read available data
-        let reader = session
-            .master
-            .try_clone_reader()
-            .map_err(|e| TerminalError::ReadFailed(e.to_string()))?;
-
-        let mut reader = std::io::BufReader::new(reader);
-        let mut buffer = Vec::new();
-        let mut temp_buf = [0u8; 4096];
-
-        // Read all available data without blocking
-        loop {
-            match reader.read(&mut temp_buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => buffer.extend_from_slice(&temp_buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(TerminalError::ReadFailed(e.to_string())),
-            }
-        }
-
-        String::from_utf8(buffer).map_err(|e| TerminalError::ReadFailed(e.to_string()))
-    }
-
     /// Resize terminal
     pub fn resize_terminal(
         &self,
@@ -326,12 +369,6 @@ impl TerminalManager {
             .keys()
             .cloned()
             .collect()
-    }
-}
-
-impl Default for TerminalManager {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

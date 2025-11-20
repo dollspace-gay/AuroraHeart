@@ -15,7 +15,7 @@ use aurora_core::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Manager, State};
 use terminal::{ShellType, TerminalId, TerminalManager};
 
 /// Initialize tracing for logging
@@ -48,7 +48,7 @@ pub struct FileOpenResult {
 
 /// Application state shared across Tauri commands
 pub struct AppState {
-    pub project_root: PathBuf,
+    pub project_root: Arc<Mutex<PathBuf>>,
     pub conversation: Arc<Mutex<Conversation>>,
     pub terminal_manager: TerminalManager,
 }
@@ -111,7 +111,8 @@ fn mask_api_key(api_key: &str) -> String {
 #[tauri::command]
 async fn get_file_tree(state: State<'_, AppState>) -> Result<Vec<FileTreeItem>, String> {
     tracing::info!("get_file_tree command called");
-    Ok(load_file_tree_internal(&state.project_root))
+    let project_root = state.project_root.lock().unwrap();
+    Ok(load_file_tree_internal(&*project_root))
 }
 
 /// Get directory contents
@@ -193,7 +194,8 @@ async fn save_file(path: String, content: String) -> Result<(), String> {
 async fn save_api_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("save_api_key command called");
 
-    let store = CredentialStore::for_project(&state.project_root);
+    let project_root = state.project_root.lock().unwrap();
+    let store = CredentialStore::for_project(&*project_root);
     store
         .store("anthropic_api_key", &key, "auroraheart")
         .map_err(|e| {
@@ -211,7 +213,8 @@ async fn save_api_key(key: String, state: State<'_, AppState>) -> Result<(), Str
 async fn load_api_key(state: State<'_, AppState>) -> Result<String, String> {
     tracing::info!("load_api_key command called");
 
-    let store = CredentialStore::for_project(&state.project_root);
+    let project_root = state.project_root.lock().unwrap();
+    let store = CredentialStore::for_project(&*project_root);
     store
         .retrieve("anthropic_api_key", "auroraheart")
         .map_err(|e| {
@@ -226,14 +229,17 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
     tracing::info!("send_message command called: {}", message);
 
     // Load API key
-    let store = CredentialStore::for_project(&state.project_root);
-    let api_key = store
-        .retrieve("anthropic_api_key", "auroraheart")
-        .map_err(|e| {
-            let error_msg = "⚠ No API key configured. Please set your API key in Settings.";
-            tracing::error!("Failed to load API key: {}", e);
-            error_msg.to_string()
-        })?;
+    let api_key = {
+        let project_root = state.project_root.lock().unwrap();
+        let store = CredentialStore::for_project(&*project_root);
+        store
+            .retrieve("anthropic_api_key", "auroraheart")
+            .map_err(|e| {
+                let error_msg = "⚠ No API key configured. Please set your API key in Settings.";
+                tracing::error!("Failed to load API key: {}", e);
+                error_msg.to_string()
+            })?
+    };
 
     // Add user message to conversation and truncate if needed
     {
@@ -250,10 +256,17 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
     let client = AnthropicClient::new(api_key);
 
     // Create tool executor
-    let executor = ToolExecutor::with_working_directory(state.project_root.clone());
+    let project_root_path = {
+        let guard = state.project_root.lock().unwrap();
+        guard.clone()
+    };
+    let executor = ToolExecutor::with_working_directory(project_root_path);
 
     // Clone conversation for agentic loop
-    let mut conv = state.conversation.lock().unwrap().clone();
+    let mut conv = {
+        let guard = state.conversation.lock().unwrap();
+        guard.clone()
+    };
 
     // Run agentic loop
     let events = client
@@ -364,9 +377,13 @@ async fn spawn_terminal(
         rows
     );
 
+    // Use project root as working directory
+    let project_root = state.project_root.lock().unwrap();
+    let working_dir = project_root.to_string_lossy().to_string();
+
     state
         .terminal_manager
-        .spawn_terminal(shell_type, cols, rows)
+        .spawn_terminal(shell_type, cols, rows, Some(working_dir))
         .map_err(|e| {
             let error_msg = format!("Failed to spawn terminal: {}", e);
             tracing::error!("{}", error_msg);
@@ -385,18 +402,6 @@ async fn write_terminal(
 
     state.terminal_manager.write_terminal(&id, &data).map_err(|e| {
         let error_msg = format!("Failed to write to terminal: {}", e);
-        tracing::error!("{}", error_msg);
-        error_msg
-    })
-}
-
-/// Read available data from terminal
-#[tauri::command]
-async fn read_terminal(id: TerminalId, state: State<'_, AppState>) -> Result<String, String> {
-    tracing::debug!("read_terminal command called: {}", id);
-
-    state.terminal_manager.read_terminal(&id).map_err(|e| {
-        let error_msg = format!("Failed to read from terminal: {}", e);
         tracing::error!("{}", error_msg);
         error_msg
     })
@@ -461,17 +466,17 @@ pub struct GitStatus {
 async fn get_git_status(state: State<'_, AppState>) -> Result<GitStatus, String> {
     tracing::info!("get_git_status command called");
 
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     // Get current branch
     let branch_output = std::process::Command::new("git")
         .args(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(project_root)
+        .current_dir(&project_root)
         .output();
 
     let branch = match branch_output {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
         _ => None,
     }
@@ -480,7 +485,7 @@ async fn get_git_status(state: State<'_, AppState>) -> Result<GitStatus, String>
     // Get status
     let status_output = std::process::Command::new("git")
         .args(&["status", "--porcelain"])
-        .current_dir(project_root)
+        .current_dir(&project_root)
         .output()
         .map_err(|e| format!("Failed to run git status: {}", e))?;
 
@@ -513,7 +518,7 @@ async fn get_git_status(state: State<'_, AppState>) -> Result<GitStatus, String>
     // Get ahead/behind count
     let ahead_behind_output = std::process::Command::new("git")
         .args(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
-        .current_dir(project_root)
+        .current_dir(&project_root)
         .output();
 
     let (ahead, behind) = match ahead_behind_output {
@@ -545,7 +550,7 @@ async fn get_git_status(state: State<'_, AppState>) -> Result<GitStatus, String>
 /// Check if a file has git modifications
 #[tauri::command]
 async fn is_file_modified(path: String, state: State<'_, AppState>) -> Result<bool, String> {
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     let output = std::process::Command::new("git")
         .args(&["status", "--porcelain", &path])
@@ -560,12 +565,12 @@ async fn is_file_modified(path: String, state: State<'_, AppState>) -> Result<bo
 #[tauri::command]
 async fn git_stage(files: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("git_stage command called for {} files", files.len());
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     for file in &files {
         let output = std::process::Command::new("git")
             .args(&["add", file])
-            .current_dir(project_root)
+            .current_dir(&project_root)
             .output()
             .map_err(|e| format!("Failed to stage file: {}", e))?;
 
@@ -582,12 +587,12 @@ async fn git_stage(files: Vec<String>, state: State<'_, AppState>) -> Result<(),
 #[tauri::command]
 async fn git_unstage(files: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("git_unstage command called for {} files", files.len());
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     for file in &files {
         let output = std::process::Command::new("git")
             .args(&["restore", "--staged", file])
-            .current_dir(project_root)
+            .current_dir(&project_root)
             .output()
             .map_err(|e| format!("Failed to unstage file: {}", e))?;
 
@@ -604,7 +609,7 @@ async fn git_unstage(files: Vec<String>, state: State<'_, AppState>) -> Result<(
 #[tauri::command]
 async fn git_commit(message: String, amend: bool, state: State<'_, AppState>) -> Result<String, String> {
     tracing::info!("git_commit command called: amend={}", amend);
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     let mut args = vec!["commit", "-m", &message];
     if amend {
@@ -630,7 +635,7 @@ async fn git_commit(message: String, amend: bool, state: State<'_, AppState>) ->
 #[tauri::command]
 async fn git_push(remote: Option<String>, branch: Option<String>, state: State<'_, AppState>) -> Result<String, String> {
     tracing::info!("git_push command called");
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     let mut args = vec!["push"];
     if let Some(ref r) = remote {
@@ -659,7 +664,7 @@ async fn git_push(remote: Option<String>, branch: Option<String>, state: State<'
 #[tauri::command]
 async fn git_pull(state: State<'_, AppState>) -> Result<String, String> {
     tracing::info!("git_pull command called");
-    let project_root = &state.project_root;
+    let project_root = state.project_root.lock().unwrap().clone();
 
     let output = std::process::Command::new("git")
         .args(&["pull"])
@@ -674,6 +679,51 @@ async fn git_pull(state: State<'_, AppState>) -> Result<String, String> {
 
     let result = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(result)
+}
+
+/// Get current project root path
+#[tauri::command]
+async fn get_project_root(state: State<'_, AppState>) -> Result<String, String> {
+    let project_root = state.project_root.lock().unwrap();
+    Ok(project_root.to_string_lossy().to_string())
+}
+
+/// Open folder picker and set new project root
+#[tauri::command]
+async fn open_folder(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    use tauri_plugin_dialog::DialogExt;
+
+    tracing::info!("open_folder command called");
+
+    // Show folder picker dialog
+    let folder_path = app
+        .dialog()
+        .file()
+        .set_title("Select Project Folder")
+        .blocking_pick_folder();
+
+    if let Some(folder) = folder_path {
+        let path = folder.into_path().map_err(|e| format!("Failed to convert path: {}", e))?;
+        tracing::info!("Selected folder: {:?}", path);
+
+        // Update project root
+        {
+            let mut project_root = state.project_root.lock().unwrap();
+            *project_root = path.clone();
+        }
+
+        // Emit event to refresh frontend
+        app.emit("project-folder-changed", path.to_string_lossy().to_string())
+            .map_err(|e| format!("Failed to emit event: {}", e))?;
+
+        Ok(path.to_string_lossy().to_string())
+    } else {
+        Err("No folder selected".to_string())
+    }
 }
 
 // ============================================================================
@@ -748,20 +798,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          You help developers with coding tasks, explaining code, debugging, and general programming questions.",
     )));
 
-    // Create terminal manager
-    let terminal_manager = TerminalManager::new();
-
-    // Create application state
-    let app_state = AppState {
-        project_root,
-        conversation,
-        terminal_manager,
-    };
-
     // Build and run Tauri application
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(app_state)
+        .setup(move |app| {
+            // Create terminal manager with app handle
+            let terminal_manager = TerminalManager::new(app.handle().clone());
+
+            // Create application state
+            let app_state = AppState {
+                project_root: Arc::new(Mutex::new(project_root)),
+                conversation,
+                terminal_manager,
+            };
+
+            // Manage the state
+            app.manage(app_state);
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_file_tree,
             get_directory_contents,
@@ -776,7 +831,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_default_shell,
             spawn_terminal,
             write_terminal,
-            read_terminal,
             resize_terminal,
             close_terminal,
             list_terminals,
@@ -787,6 +841,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             git_commit,
             git_push,
             git_pull,
+            get_project_root,
+            open_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
